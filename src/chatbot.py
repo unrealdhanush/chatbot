@@ -1,24 +1,178 @@
 import os
-from openai import OpenAI
+import requests
+import sqlite3
+import streamlit as st
 from dotenv import load_dotenv, find_dotenv
+from openai import OpenAI
+from serpapi import GoogleSearch
 
-def get_completion(prompt):
-    _ = load_dotenv(find_dotenv())
-    messages = [{"role": "user", "content": prompt}]
-    client = OpenAI(
-    api_key=os.environ.get("OPEN_API_KEY"),
-    )
+# Load API keys from .env file
+_ = load_dotenv(find_dotenv())
+openai_api_key = os.environ.get("OPEN_API_KEY")
+serpapi_api_key = os.environ.get("SERP_API_KEY")
+weather_api_key = os.environ.get("WEATHER_API_KEY")
+
+# Initialize OpenAI
+client = OpenAI(api_key=openai_api_key)
+
+# Initialize database connection
+db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'chatbot_memory.db')
+conn = sqlite3.connect(db_path)
+c = conn.cursor()
+
+# Create a table to store user preferences or frequently asked questions
+c.execute('''CREATE TABLE IF NOT EXISTS memory
+             (question TEXT, response TEXT)''')
+conn.commit()
+
+# Prompt Creator
+def create_prompt(user_input):
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": user_input}
+    ]
+    return messages
+
+# Define the function to get completion from OpenAI API
+def get_completion(prompt, model="gpt-3.5-turbo"):
     response = client.chat.completions.create(
-    messages=messages,
-    model="gpt-3.5-turbo",
+        model=model,
+        messages=create_prompt(prompt),
     )
     return response.choices[0].message.content
 
+# Define the function to search the web using SerpAPI
+def search_web(query):
+    search = GoogleSearch({"q": query, "api_key": serpapi_api_key})
+    results = search.get_dict()
+    return results.get("organic_results", [])
 
-customer_email = """Arrr, I be fuming that me blender lid flew off and splattered me kitchen walls with smoothie! And to make matters worse, the warranty don't cover the cost of cleaning up me kitchen. I need yer help right now, matey!"""
+# Define the function to get weather information
+def get_weather(location="London"):
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={location}&appid={weather_api_key}&units=metric"
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        weather_description = data['weather'][0]['description']
+        temperature = data['main']['temp']
+        return f"The weather in {location} is {weather_description} with a temperature of {temperature}°C."
+    else:
+        return "Sorry, I couldn't retrieve the weather information."
 
-style = """American English in a calm, kind and respectful tone"""
+# Streamlit UI
+st.set_page_config(layout="wide")
 
-prompt = f"""Translate the text that is delimited by triple backticks into a style that is {style}. text: ```{customer_email}```"""
+# Add CSS for the text bubbles and dynamic theme support
+st.markdown(
+    """
+    <style>
+    .main {
+        color: var(--text-color);
+    }
+    .stTextInput>div>div>input {
+        color: var(--input-text-color);
+        background-color: var(--input-bg-color);
+    }
+    .stButton>button {
+        background-color: var(--button-bg-color);
+        color: var(--button-text-color);
+    }
+    .bubble-container {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        margin-bottom: 10px;
+    }
+    .bubble {
+        max-width: 70%;
+        padding: 10px;
+        border-radius: 20px;
+        margin: 5px 0;
+        position: relative;
+    }
+    .bubble.user {
+        align-self: flex-end;
+        background-color: #007bff;
+        color: white;
+    }
+    .bubble.assistant {
+        align-self: flex-start;
+        background-color: #f1f1f1;
+        color: black;
+    }
+    .icon {
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        position: absolute;
+        top: -20px;
+    }
+    .icon.user {
+        left: -40px;
+    }
+    .icon.assistant {
+        right: -40px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-print(get_completion(prompt))
+# Initialize session state to store chat history
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+# Create a header container
+header_container = st.container()
+with header_container:
+    st.title("Personal Assistant Chatbot")
+
+# Container for the conversation
+conversation_container = st.container()
+
+# Form for user input
+input_container = st.container()
+with input_container:
+    with st.form(key='chat_form', clear_on_submit=True):
+        user_input = st.text_input("Ask your personal assistant anything:")
+        submit_button = st.form_submit_button(label='Ask')
+
+if submit_button and user_input:
+    # Check if the question is in the memory database
+    c.execute("SELECT response FROM memory WHERE question = ?", (user_input,))
+    row = c.fetchone()
+    if row:
+        response = row[0]
+    else:
+        if "weather" in user_input.lower():
+            location = user_input.split("in")[-1].strip() if "in" in user_input.lower() else "London"
+            response = get_weather(location)
+        elif "search" in user_input.lower():
+            search_results = search_web(user_input)
+            response = "\n".join([f"**{result['title']}**\n{result['link']}\n{result['snippet']}\n" for result in search_results])
+        else:
+            response = get_completion(user_input, model="gpt-3.5-turbo")
+
+        # Save the question and response in the memory database
+        c.execute("INSERT INTO memory (question, response) VALUES (?, ?)", (user_input, response))
+        conn.commit()
+
+    # Update chat history in session state
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
+    st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+# Display chat history
+with conversation_container:
+    for chat in st.session_state.chat_history:
+        role_class = 'user' if chat['role'] == 'user' else 'assistant'
+        icon_url = "https://img.icons8.com/ios-filled/50/000000/user-male-circle.png" if chat['role'] == 'user' else "https://img.icons8.com/fluency-systems-filled/48/bot.png"
+        st.markdown(
+            f'''
+            <div class="bubble-container">
+                <img src="{icon_url}" class="icon {role_class}" />
+                <div class="bubble {role_class}">{chat["content"]}</div>
+            </div>
+            ''',
+            unsafe_allow_html=True
+        )
+
+# Close the database connection
+conn.close()
