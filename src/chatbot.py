@@ -16,7 +16,14 @@ weather_api_key = os.environ.get("WEATHER_API_KEY")
 client = OpenAI(api_key=openai_api_key)
 
 # Initialize database connection
-db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'chatbot_memory.db')
+base_dir = os.path.dirname(__file__)
+project_dir = os.path.dirname(base_dir)
+data_dir = os.path.join(project_dir, 'data')
+db_path = os.path.join(data_dir, 'chatbot_memory.db')
+
+# Create the data directory if it doesn't exist
+os.makedirs(data_dir, exist_ok=True)
+
 conn = sqlite3.connect(db_path)
 c = conn.cursor()
 
@@ -136,6 +143,24 @@ with input_container:
         submit_button = st.form_submit_button(label='Ask')
 
 if submit_button and user_input:
+    # Add the user's message to chat history immediately
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+    # Display chat history
+    with conversation_container:
+        for chat in st.session_state.chat_history:
+            role_class = 'user' if chat['role'] == 'user' else 'assistant'
+            icon_url = "https://img.icons8.com/ios-filled/50/000000/user-male-circle.png" if chat['role'] == 'user' else "https://img.icons8.com/fluency-systems-filled/48/bot.png"
+            st.markdown(
+                f'''
+                <div class="bubble-container">
+                    <img src="{icon_url}" class="icon {role_class}" />
+                    <div class="bubble {role_class}">{chat["content"]}</div>
+                </div>
+                ''',
+                unsafe_allow_html=True
+            )
+
     # Check if the question is in the memory database
     c.execute("SELECT response FROM memory WHERE question = ?", (user_input,))
     row = c.fetchone()
@@ -155,20 +180,18 @@ if submit_button and user_input:
         c.execute("INSERT INTO memory (question, response) VALUES (?, ?)", (user_input, response))
         conn.commit()
 
-    # Update chat history in session state
-    st.session_state.chat_history.append({"role": "user", "content": user_input})
+    # Update chat history with the assistant's response
     st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-# Display chat history
-with conversation_container:
-    for chat in st.session_state.chat_history:
-        role_class = 'user' if chat['role'] == 'user' else 'assistant'
-        icon_url = "https://img.icons8.com/ios-filled/50/000000/user-male-circle.png" if chat['role'] == 'user' else "https://img.icons8.com/fluency-systems-filled/48/bot.png"
+    # Display only the assistant's response
+    with conversation_container:
+        role_class = 'assistant'
+        icon_url = "https://img.icons8.com/fluency-systems-filled/48/bot.png"
         st.markdown(
             f'''
             <div class="bubble-container">
                 <img src="{icon_url}" class="icon {role_class}" />
-                <div class="bubble {role_class}">{chat["content"]}</div>
+                <div class="bubble {role_class}">{response}</div>
             </div>
             ''',
             unsafe_allow_html=True
