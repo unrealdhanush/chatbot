@@ -5,6 +5,7 @@ import streamlit as st
 from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 from serpapi import GoogleSearch
+import datetime
 
 # Load API keys from .env file
 _ = load_dotenv(find_dotenv())
@@ -15,14 +16,11 @@ weather_api_key = os.environ.get("WEATHER_API_KEY")
 # Initialize OpenAI
 client = OpenAI(api_key=openai_api_key)
 
-# Initialize database connection
-base_dir = os.path.dirname(__file__)
+# Get the base directory and set the data directory path
+base_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.dirname(base_dir)
 data_dir = os.path.join(project_dir, 'data')
 db_path = os.path.join(data_dir, 'chatbot_memory.db')
-
-# Create the data directory if it doesn't exist
-os.makedirs(data_dir, exist_ok=True)
 
 conn = sqlite3.connect(db_path)
 c = conn.cursor()
@@ -30,6 +28,16 @@ c = conn.cursor()
 # Create a table to store user preferences or frequently asked questions
 c.execute('''CREATE TABLE IF NOT EXISTS memory
              (question TEXT, response TEXT)''')
+conn.commit()
+
+# Create a table to store chat sessions
+c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions
+             (session_id TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+conn.commit()
+
+# Create a table to store chat messages
+c.execute('''CREATE TABLE IF NOT EXISTS chat_messages
+             (session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 conn.commit()
 
 # Prompt Creator
@@ -66,8 +74,108 @@ def get_weather(location="London"):
     else:
         return "Sorry, I couldn't retrieve the weather information."
 
+# Function to load chat history
+def load_chat_history(session_id):
+    c.execute("SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY timestamp ASC", (session_id,))
+    return c.fetchall()
+
 # Streamlit UI
 st.set_page_config(layout="wide")
+
+# Sidebar for chat sessions
+st.sidebar.title("Chat Sessions")
+
+# Function to create a new chat session
+def create_new_session():
+    session_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+    c.execute("INSERT INTO chat_sessions (session_id) VALUES (?)", (session_id,))
+    conn.commit()
+    return session_id
+
+# Load chat sessions
+c.execute("SELECT session_id, timestamp FROM chat_sessions ORDER BY timestamp DESC")
+sessions = c.fetchall()
+
+# Display chat sessions in the sidebar with better styling
+session_ids = [session[0] for session in sessions]
+session_timestamps = [session[1] for session in sessions]
+session_labels = [f"Chat {i+1}: {session_timestamps[i]}" for i in range(len(sessions))]
+
+# Initialize selected_session in session state if not already present
+if 'selected_session' not in st.session_state:
+    st.session_state.selected_session = session_ids[0] if session_ids else None
+
+# Add CSS for better sidebar styling
+st.sidebar.markdown(
+    """
+    <style>
+    .sidebar .block-container {
+        padding-top: 1rem;
+        padding-bottom: 1rem;
+    }
+    .sidebar .block-container .stButton {
+        margin-bottom: 1rem;
+    }
+    .session-button {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px;
+        border: 1px solid #e6e6e6;
+        border-radius: 5px;
+        margin-bottom: 10px;
+        cursor: pointer;
+    }
+    .session-button:hover {
+        background-color: red;
+    }
+    .session-button.selected {
+        background-color: gray;
+        border: 2px solid red;
+        color: white;
+    }
+    .session-button span {
+        flex-grow: 1;
+    }
+    .session-button button {
+        background: none;
+        border: none;
+        color: #007bff;
+        cursor: pointer;
+        font-size: 14px;
+    }
+    .session-button.selected button {
+        color: white;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+def display_session_button(session_id, label, is_selected):
+    button_class = "session-button selected" if is_selected else "session-button"
+    clicked = st.sidebar.button(label, key=session_id)
+    if clicked:
+        st.session_state.selected_session = session_id
+        st.session_state.chat_history = load_chat_history(session_id)
+        st.rerun()
+
+# Display session buttons
+for i, session_id in enumerate(session_ids):
+    label = session_labels[i]
+    is_selected = session_id == st.session_state.selected_session
+    display_session_button(session_id, label, is_selected)
+
+# Button to create a new session
+if st.sidebar.button("New Chat"):
+    st.session_state.selected_session = create_new_session()
+    st.session_state.chat_history = []
+    st.rerun()
+
+# Load chat messages for the selected session
+if st.session_state.selected_session:
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = load_chat_history(st.session_state.selected_session)
 
 # Add CSS for the text bubbles and dynamic theme support
 st.markdown(
@@ -86,46 +194,41 @@ st.markdown(
     }
     .bubble-container {
         display: flex;
-        flex-direction: column;
-        align-items: flex-start;
+        align-items: flex-end;
         margin-bottom: 10px;
     }
     .bubble {
         max-width: 70%;
         padding: 10px;
         border-radius: 20px;
-        margin: 5px 0;
+        margin: 5px;
         position: relative;
     }
     .bubble.user {
-        align-self: flex-end;
         background-color: #007bff;
         color: white;
+        margin-left: auto;
+        order: 1;
     }
     .bubble.assistant {
-        align-self: flex-start;
         background-color: #f1f1f1;
         color: black;
+        order: 2;
     }
     .icon {
         width: 30px;
         height: 30px;
         border-radius: 50%;
-        position: absolute;
-        top: -20px;
+        margin: 5px;
     }
     .icon.user {
-        left: -40px;
+        order: 2;
     }
     .icon.assistant {
-        right: -40px;
+        order: 1;
     }
     </style>
     """, unsafe_allow_html=True)
-
-# Initialize session state to store chat history
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
 
 # Create a header container
 header_container = st.container()
@@ -144,22 +247,9 @@ with input_container:
 
 if submit_button and user_input:
     # Add the user's message to chat history immediately
-    st.session_state.chat_history.append({"role": "user", "content": user_input})
-
-    # Display chat history
-    with conversation_container:
-        for chat in st.session_state.chat_history:
-            role_class = 'user' if chat['role'] == 'user' else 'assistant'
-            icon_url = "https://img.icons8.com/ios-filled/50/000000/user-male-circle.png" if chat['role'] == 'user' else "https://img.icons8.com/fluency-systems-filled/48/bot.png"
-            st.markdown(
-                f'''
-                <div class="bubble-container">
-                    <img src="{icon_url}" class="icon {role_class}" />
-                    <div class="bubble {role_class}">{chat["content"]}</div>
-                </div>
-                ''',
-                unsafe_allow_html=True
-            )
+    st.session_state.chat_history.append(("user", user_input))
+    c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "user", user_input))
+    conn.commit()
 
     # Check if the question is in the memory database
     c.execute("SELECT response FROM memory WHERE question = ?", (user_input,))
@@ -181,21 +271,24 @@ if submit_button and user_input:
         conn.commit()
 
     # Update chat history with the assistant's response
-    st.session_state.chat_history.append({"role": "assistant", "content": response})
+    st.session_state.chat_history.append(("assistant", response))
+    c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "assistant", response))
+    conn.commit()
 
-    # Display only the assistant's response
+# Display chat history when a session is selected
+if st.session_state.selected_session and st.session_state.chat_history:
     with conversation_container:
-        role_class = 'assistant'
-        icon_url = "https://img.icons8.com/fluency-systems-filled/48/bot.png"
-        st.markdown(
-            f'''
-            <div class="bubble-container">
-                <img src="{icon_url}" class="icon {role_class}" />
-                <div class="bubble {role_class}">{response}</div>
-            </div>
-            ''',
-            unsafe_allow_html=True
-        )
+        for role, content in st.session_state.chat_history:
+            role_class = 'user' if role == 'user' else 'assistant'
+            icon_url = "https://img.icons8.com/ios-filled/50/000000/user-male-circle.png" if role == 'user' else "https://img.icons8.com/fluency-systems-filled/48/bot.png"
+            st.markdown(
+                f'''
+                <div class="bubble-container">
+                    <div class="bubble {role_class}">{content}</div>
+                    <img src="{icon_url}" class="icon {role_class}" />
+                </div>
+                ''',
+                unsafe_allow_html=True
+            )
 
-# Close the database connection
 conn.close()
