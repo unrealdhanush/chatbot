@@ -8,6 +8,11 @@ This is a personal project to create a chatbot using Streamlit, OpenAI's GPT-3.5
 - Upload and process documents (PDF, DOCX, TXT)
 - Search the web using SerpAPI
 - Get weather information using OpenWeatherMap API
+- Implement Retrieval-Augmented Generation (RAG) for enhanced responses
+
+## Retrieval-Augmented Generation (RAG)
+
+RAG is a technique that combines retrieval-based and generation-based methods to provide more accurate and contextually relevant responses. In this project, RAG is implemented to enhance the chatbot's ability to generate responses based on both the user's input and the additional context provided by uploaded documents.
 
 ## Setup
 
@@ -36,7 +41,9 @@ This is a personal project to create a chatbot using Streamlit, OpenAI's GPT-3.5
     ```
 
 ## Usage
+
 Open your browser and go to `http://localhost:8501` to interact with the chatbot.
 
 ## License
+
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
