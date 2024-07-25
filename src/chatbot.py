@@ -6,6 +6,10 @@ from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 from serpapi import GoogleSearch
 import datetime
+from PyPDF2 import PdfReader
+from docx import Document
+import io
+import re
 
 # Load API keys from .env file
 _ = load_dotenv(find_dotenv())
@@ -25,26 +29,41 @@ db_path = os.path.join(data_dir, 'chatbot_memory.db')
 conn = sqlite3.connect(db_path)
 c = conn.cursor()
 
-# Create a table to store user preferences or frequently asked questions
-c.execute('''CREATE TABLE IF NOT EXISTS memory
-             (question TEXT, response TEXT)''')
+# Create tables for storing data
+c.execute('''CREATE TABLE IF NOT EXISTS memory (question TEXT, response TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions (session_id TEXT PRIMARY KEY, name TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+c.execute('''CREATE TABLE IF NOT EXISTS chat_messages (session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+c.execute('''CREATE TABLE IF NOT EXISTS documents (session_id TEXT, filename TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
 conn.commit()
 
-# Create a table to store chat sessions
-c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions
-             (session_id TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-conn.commit()
+# Function to process uploaded files
+def process_uploaded_file(uploaded_file):
+    if uploaded_file.type == "application/pdf":
+        pdf_reader = PdfReader(uploaded_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text()
+        return text
+    elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        doc = Document(uploaded_file)
+        return "\n".join([para.text for para in doc.paragraphs])
+    else:
+        return uploaded_file.getvalue().decode("utf-8")
 
-# Create a table to store chat messages
-c.execute('''CREATE TABLE IF NOT EXISTS chat_messages
-             (session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-conn.commit()
+# Function to truncate text to fit within token limits
+def truncate_text(text, max_tokens=4000):
+    words = text.split()
+    if len(words) > max_tokens:
+        return ' '.join(words[:max_tokens])
+    return text
 
-# Prompt Creator
-def create_prompt(user_input):
+# Function to create a prompt for OpenAI
+def create_prompt(user_input, doc_content):
+    truncated_doc_content = truncate_text(doc_content)
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": user_input}
+        {"role": "user", "content": user_input},
+        {"role": "system", "content": f"Here is some additional context from the uploaded documents:\n{truncated_doc_content}"}
     ]
     return messages
 
@@ -52,7 +71,7 @@ def create_prompt(user_input):
 def get_completion(prompt, model="gpt-3.5-turbo"):
     response = client.chat.completions.create(
         model=model,
-        messages=create_prompt(prompt),
+        messages=prompt,
     )
     return response.choices[0].message.content
 
@@ -79,6 +98,12 @@ def load_chat_history(session_id):
     c.execute("SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY timestamp ASC", (session_id,))
     return c.fetchall()
 
+# Function to load document content
+def load_document_content(session_id):
+    c.execute("SELECT content FROM documents WHERE session_id = ?", (session_id,))
+    rows = c.fetchall()
+    return "\n".join([row[0] for row in rows])
+
 # Streamlit UI
 st.set_page_config(layout="wide")
 
@@ -88,83 +113,58 @@ st.sidebar.title("Chat Sessions")
 # Function to create a new chat session
 def create_new_session():
     session_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
-    c.execute("INSERT INTO chat_sessions (session_id) VALUES (?)", (session_id,))
+    c.execute("INSERT INTO chat_sessions (session_id, name) VALUES (?, ?)", (session_id, f"Chat {session_id[-6:]}"))
     conn.commit()
     return session_id
 
 # Load chat sessions
-c.execute("SELECT session_id, timestamp FROM chat_sessions ORDER BY timestamp DESC")
+c.execute("SELECT session_id, name, timestamp FROM chat_sessions ORDER BY timestamp DESC")
 sessions = c.fetchall()
 
 # Display chat sessions in the sidebar with better styling
 session_ids = [session[0] for session in sessions]
-session_timestamps = [session[1] for session in sessions]
-session_labels = [f"Chat {i+1}: {session_timestamps[i]}" for i in range(len(sessions))]
+session_names = [session[1] for session in sessions]
+session_timestamps = [session[2] for session in sessions]
 
 # Initialize selected_session in session state if not already present
 if 'selected_session' not in st.session_state:
     st.session_state.selected_session = session_ids[0] if session_ids else None
 
-# Add CSS for better sidebar styling
-st.sidebar.markdown(
-    """
-    <style>
-    .sidebar .block-container {
-        padding-top: 1rem;
-        padding-bottom: 1rem;
-    }
-    .sidebar .block-container .stButton {
-        margin-bottom: 1rem;
-    }
-    .session-button {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 10px;
-        border: 1px solid #e6e6e6;
-        border-radius: 5px;
-        margin-bottom: 10px;
-        cursor: pointer;
-    }
-    .session-button:hover {
-        background-color: red;
-    }
-    .session-button.selected {
-        background-color: gray;
-        border: 2px solid red;
-        color: white;
-    }
-    .session-button span {
-        flex-grow: 1;
-    }
-    .session-button button {
-        background: none;
-        border: none;
-        color: #007bff;
-        cursor: pointer;
-        font-size: 14px;
-    }
-    .session-button.selected button {
-        color: white;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+# Function to display the sidebar menu with chat sessions
+def display_sidebar_menu():
+    selected_session = st.session_state.selected_session
+    for i, session_id in enumerate(session_ids):
+        label = session_names[i] if session_names[i] else f"Chat {session_id[-6:]}"
+        is_selected = session_id == selected_session
+        with st.sidebar.expander(label, expanded=is_selected):
+            if st.button("Open", key=f"open_{session_id}"):
+                st.session_state.selected_session = session_id
+                st.session_state.chat_history = load_chat_history(session_id)
+                st.session_state.doc_content = load_document_content(session_id)
+                st.rerun()
+            if st.button("Rename", key=f"rename_{session_id}"):
+                st.session_state.rename_session_id = session_id
+                st.session_state.rename_input = ""
+                st.rerun()
+            if 'rename_session_id' in st.session_state and st.session_state.rename_session_id == session_id:
+                st.session_state.rename_input = st.text_input("New name", key=f"new_name_{session_id}")
+                if st.button("Save", key=f"save_{session_id}"):
+                    new_name = st.session_state.rename_input
+                    if new_name:
+                        c.execute("UPDATE chat_sessions SET name = ? WHERE session_id = ?", (new_name, session_id))
+                        conn.commit()
+                        del st.session_state.rename_session_id
+                        st.rerun()
+            if st.button("Delete", key=f"delete_{session_id}"):
 
-def display_session_button(session_id, label, is_selected):
-    button_class = "session-button selected" if is_selected else "session-button"
-    clicked = st.sidebar.button(label, key=session_id)
-    if clicked:
-        st.session_state.selected_session = session_id
-        st.session_state.chat_history = load_chat_history(session_id)
-        st.rerun()
+                c.execute("DELETE FROM chat_sessions WHERE session_id = ?", (session_id,))
+                conn.commit()
+                st.session_state.selected_session = None
+                st.session_state.chat_history = []
+                st.rerun()
 
-# Display session buttons
-for i, session_id in enumerate(session_ids):
-    label = session_labels[i]
-    is_selected = session_id == st.session_state.selected_session
-    display_session_button(session_id, label, is_selected)
+# Display the sidebar menu
+display_sidebar_menu()
 
 # Button to create a new session
 if st.sidebar.button("New Chat"):
@@ -176,6 +176,8 @@ if st.sidebar.button("New Chat"):
 if st.session_state.selected_session:
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = load_chat_history(st.session_state.selected_session)
+    if 'doc_content' not in st.session_state:
+        st.session_state.doc_content = load_document_content(st.session_state.selected_session)
 
 # Add CSS for the text bubbles and dynamic theme support
 st.markdown(
@@ -243,6 +245,7 @@ input_container = st.container()
 with input_container:
     with st.form(key='chat_form', clear_on_submit=True):
         user_input = st.text_input("Ask your personal assistant anything:")
+        uploaded_file = st.file_uploader("Upload a file", type=["txt", "pdf", "docx"])
         submit_button = st.form_submit_button(label='Ask')
 
 if submit_button and user_input:
@@ -250,6 +253,14 @@ if submit_button and user_input:
     st.session_state.chat_history.append(("user", user_input))
     c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "user", user_input))
     conn.commit()
+
+    # Process uploaded file
+    if uploaded_file:
+        file_content = process_uploaded_file(uploaded_file)
+        st.session_state.doc_content = file_content
+        c.execute("INSERT INTO documents (session_id, filename, content) VALUES (?, ?, ?)",
+                  (st.session_state.selected_session, uploaded_file.name, file_content))
+        conn.commit()
 
     # Check if the question is in the memory database
     c.execute("SELECT response FROM memory WHERE question = ?", (user_input,))
@@ -264,7 +275,8 @@ if submit_button and user_input:
             search_results = search_web(user_input)
             response = "\n".join([f"**{result['title']}**\n{result['link']}\n{result['snippet']}\n" for result in search_results])
         else:
-            response = get_completion(user_input, model="gpt-3.5-turbo")
+            prompt = create_prompt(user_input, st.session_state.doc_content)
+            response = get_completion(prompt, model="gpt-3.5-turbo")
 
         # Save the question and response in the memory database
         c.execute("INSERT INTO memory (question, response) VALUES (?, ?)", (user_input, response))
