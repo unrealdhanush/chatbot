@@ -2,87 +2,100 @@ import os
 import requests
 import sqlite3
 import streamlit as st
+import openai
+from langchain.text_splitter import CharacterTextSplitter
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores.faiss import FAISS
 from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 from serpapi import GoogleSearch
 import datetime
 from PyPDF2 import PdfReader
 from docx import Document
-import io
-import re
+import boto3
+from css import css
 
-# Load API keys from .env file
-_ = load_dotenv(find_dotenv())
-openai_api_key = os.environ.get("OPEN_API_KEY")
-serpapi_api_key = os.environ.get("SERP_API_KEY")
-weather_api_key = os.environ.get("WEATHER_API_KEY")
+def load_api_keys():
+    _ = load_dotenv(find_dotenv())
+    return {
+        "openai_api_key": os.environ.get("OPEN_API_KEY"),
+        "serpapi_api_key": os.environ.get("SERP_API_KEY"),
+        "weather_api_key": os.environ.get("WEATHER_API_KEY"),
+        "aws_access_key": os.environ.get("AWS_ACCESS_KEY"),
+        "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        "aws_bucket": os.environ.get("AWS_BUCKET")
+    }
 
-# Initialize OpenAI
-client = OpenAI(api_key=openai_api_key)
+def initialize_openai(api_key):
+    openai.api_key = api_key
 
-# Get the base directory and set the data directory path
-base_dir = os.path.dirname(os.path.abspath(__file__))
-project_dir = os.path.dirname(base_dir)
-data_dir = os.path.join(project_dir, 'data')
-db_path = os.path.join(data_dir, 'chatbot_memory.db')
+def initialize_db(db_path):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS memory (question TEXT, response TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions (session_id TEXT PRIMARY KEY, name TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_messages (session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS documents (session_id TEXT, filename TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    return conn, c
 
-conn = sqlite3.connect(db_path)
-c = conn.cursor()
+def save_file_to_s3(file, aws_keys):
+    s3 = boto3.client('s3', aws_access_key_id=aws_keys["aws_access_key"], aws_secret_access_key=aws_keys["aws_secret_access_key"])
+    file.seek(0)
+    s3.upload_fileobj(file, aws_keys["aws_bucket"], file.name)
 
-# Create tables for storing data
-c.execute('''CREATE TABLE IF NOT EXISTS memory (question TEXT, response TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions (session_id TEXT PRIMARY KEY, name TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-c.execute('''CREATE TABLE IF NOT EXISTS chat_messages (session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-c.execute('''CREATE TABLE IF NOT EXISTS documents (session_id TEXT, filename TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-conn.commit()
-
-# Function to process uploaded files
 def process_uploaded_file(uploaded_file):
     if uploaded_file.type == "application/pdf":
         pdf_reader = PdfReader(uploaded_file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-        return text
+        text = "".join(page.extract_text() for page in pdf_reader.pages)
     elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
         doc = Document(uploaded_file)
-        return "\n".join([para.text for para in doc.paragraphs])
+        text = "\n".join([para.text for para in doc.paragraphs])
     else:
-        return uploaded_file.getvalue().decode("utf-8")
+        text = uploaded_file.getvalue().decode("utf-8")
+    return text
 
-# Function to truncate text to fit within token limits
+def get_text_chunks(text):
+    text_splitter = CharacterTextSplitter()
+    chunks = text_splitter.split_text(text)
+    return chunks
+
+def get_vector_store(text_chunks):
+    embeddings = OpenAIEmbeddings()
+    vector_store = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
+    return vector_store
+
+def get_relevant_chunks(user_input, vector_store):
+    retriever = vector_store.as_retriever()
+    results = retriever.get_relevant_documents(user_input)
+    return [result.page_content for result in results]
+
+def get_response(user_input, text_chunks):
+    vector_store = get_vector_store(text_chunks)
+    relevant_chunks = get_relevant_chunks(user_input, vector_store)
+    context = "\n".join(relevant_chunks)
+    
+    # Generate a response using OpenAI API with the retrieved context
+    truncated_context = truncate_text(context)
+    response = openai.completions.create(
+        model="gpt-3.5-turbo-instruct",
+        prompt=f"Context:\n{truncated_context}\n\nQuestion: {user_input}\nAnswer:",
+        max_tokens=150
+    )
+    return response.choices[0].text.strip()
+
 def truncate_text(text, max_tokens=4000):
     words = text.split()
     if len(words) > max_tokens:
         return ' '.join(words[:max_tokens])
     return text
 
-# Function to create a prompt for OpenAI
-def create_prompt(user_input, doc_content):
-    truncated_doc_content = truncate_text(doc_content)
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": user_input},
-        {"role": "system", "content": f"Here is some additional context from the uploaded documents:\n{truncated_doc_content}"}
-    ]
-    return messages
-
-# Define the function to get completion from OpenAI API
-def get_completion(prompt, model="gpt-3.5-turbo"):
-    response = client.chat.completions.create(
-        model=model,
-        messages=prompt,
-    )
-    return response.choices[0].message.content
-
-# Define the function to search the web using SerpAPI
-def search_web(query):
+def search_web(query, serpapi_api_key):
     search = GoogleSearch({"q": query, "api_key": serpapi_api_key})
     results = search.get_dict()
     return results.get("organic_results", [])
 
-# Define the function to get weather information
-def get_weather(location="London"):
+def get_weather(location, weather_api_key):
     url = f"http://api.openweathermap.org/data/2.5/weather?q={location}&appid={weather_api_key}&units=metric"
     response = requests.get(url)
     if response.status_code == 200:
@@ -93,54 +106,32 @@ def get_weather(location="London"):
     else:
         return "Sorry, I couldn't retrieve the weather information."
 
-# Function to load chat history
-def load_chat_history(session_id):
+def load_chat_history(c, session_id):
     c.execute("SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY timestamp ASC", (session_id,))
     return c.fetchall()
 
-# Function to load document content
-def load_document_content(session_id):
+def load_document_content(c, session_id):
     c.execute("SELECT content FROM documents WHERE session_id = ?", (session_id,))
     rows = c.fetchall()
     return "\n".join([row[0] for row in rows])
 
-# Streamlit UI
-st.set_page_config(layout="wide")
-
-# Sidebar for chat sessions
-st.sidebar.title("Chat Sessions")
-
-# Function to create a new chat session
-def create_new_session():
+def create_new_session(c, conn):
     session_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
     c.execute("INSERT INTO chat_sessions (session_id, name) VALUES (?, ?)", (session_id, f"Chat {session_id[-6:]}"))
     conn.commit()
     return session_id
 
-# Load chat sessions
-c.execute("SELECT session_id, name, timestamp FROM chat_sessions ORDER BY timestamp DESC")
-sessions = c.fetchall()
-
-# Display chat sessions in the sidebar with better styling
-session_ids = [session[0] for session in sessions]
-session_names = [session[1] for session in sessions]
-session_timestamps = [session[2] for session in sessions]
-
-# Initialize selected_session in session state if not already present
-if 'selected_session' not in st.session_state:
-    st.session_state.selected_session = session_ids[0] if session_ids else None
-
-# Function to display the sidebar menu with chat sessions
-def display_sidebar_menu():
+def display_sidebar_menu(c, sessions, conn):
     selected_session = st.session_state.selected_session
-    for i, session_id in enumerate(session_ids):
-        label = session_names[i] if session_names[i] else f"Chat {session_id[-6:]}"
+    for i, session in enumerate(sessions):
+        session_id, session_name, timestamp = session
+        label = session_name if session_name else f"Chat {session_id[-6:]}"
         is_selected = session_id == selected_session
         with st.sidebar.expander(label, expanded=is_selected):
             if st.button("Open", key=f"open_{session_id}"):
                 st.session_state.selected_session = session_id
-                st.session_state.chat_history = load_chat_history(session_id)
-                st.session_state.doc_content = load_document_content(session_id)
+                st.session_state.chat_history = load_chat_history(c, session_id)
+                st.session_state.doc_content = load_document_content(c, session_id)
                 st.rerun()
             if st.button("Rename", key=f"rename_{session_id}"):
                 st.session_state.rename_session_id = session_id
@@ -156,151 +147,129 @@ def display_sidebar_menu():
                         del st.session_state.rename_session_id
                         st.rerun()
             if st.button("Delete", key=f"delete_{session_id}"):
-
                 c.execute("DELETE FROM chat_sessions WHERE session_id = ?", (session_id,))
                 conn.commit()
                 st.session_state.selected_session = None
                 st.session_state.chat_history = []
                 st.rerun()
 
-# Display the sidebar menu
-display_sidebar_menu()
+def add_css_and_html():
+    st.markdown(css, unsafe_allow_html=True)
 
-# Button to create a new session
-if st.sidebar.button("New Chat"):
-    st.session_state.selected_session = create_new_session()
-    st.session_state.chat_history = []
-    st.rerun()
+def main():
+    st.set_page_config(layout="wide")
+    st.sidebar.title("Chat Sessions")
 
-# Load chat messages for the selected session
-if st.session_state.selected_session:
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = load_chat_history(st.session_state.selected_session)
-    if 'doc_content' not in st.session_state:
-        st.session_state.doc_content = load_document_content(st.session_state.selected_session)
+    # Load API keys
+    api_keys = load_api_keys()
 
-# Add CSS for the text bubbles and dynamic theme support
-st.markdown(
-    """
-    <style>
-    .main {
-        color: var(--text-color);
-    }
-    .stTextInput>div>div>input {
-        color: var(--input-text-color);
-        background-color: var(--input-bg-color);
-    }
-    .stButton>button {
-        background-color: var(--button-bg-color);
-        color: var(--button-text-color);
-    }
-    .bubble-container {
-        display: flex;
-        align-items: flex-end;
-        margin-bottom: 10px;
-    }
-    .bubble {
-        max-width: 70%;
-        padding: 10px;
-        border-radius: 20px;
-        margin: 5px;
-        position: relative;
-    }
-    .bubble.user {
-        background-color: #007bff;
-        color: white;
-        margin-left: auto;
-        order: 1;
-    }
-    .bubble.assistant {
-        background-color: #f1f1f1;
-        color: black;
-        order: 2;
-    }
-    .icon {
-        width: 30px;
-        height: 30px;
-        border-radius: 50%;
-        margin: 5px;
-    }
-    .icon.user {
-        order: 2;
-    }
-    .icon.assistant {
-        order: 1;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+    # Initialize OpenAI
+    initialize_openai(api_keys["openai_api_key"])
 
-# Create a header container
-header_container = st.container()
-with header_container:
-    st.title("Personal Assistant Chatbot")
+    # Initialize database
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.dirname(base_dir)
+    data_dir = os.path.join(project_dir, 'data')
+    db_path = os.path.join(data_dir, 'chatbot_memory.db')
+    conn, c = initialize_db(db_path)
 
-# Container for the conversation
-conversation_container = st.container()
+    # Load chat sessions
+    c.execute("SELECT session_id, name, timestamp FROM chat_sessions ORDER BY timestamp DESC")
+    sessions = c.fetchall()
 
-# Form for user input
-input_container = st.container()
-with input_container:
-    with st.form(key='chat_form', clear_on_submit=True):
-        user_input = st.text_input("Ask your personal assistant anything:")
-        uploaded_file = st.file_uploader("Upload a file", type=["txt", "pdf", "docx"])
-        submit_button = st.form_submit_button(label='Ask')
+    # Initialize selected_session in session state if not already present
+    if 'selected_session' not in st.session_state:
+        st.session_state.selected_session = sessions[0][0] if sessions else None
 
-if submit_button and user_input:
-    # Add the user's message to chat history immediately
-    st.session_state.chat_history.append(("user", user_input))
-    c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "user", user_input))
-    conn.commit()
+    # Display the sidebar menu with chat sessions
+    display_sidebar_menu(c, sessions, conn)
 
-    # Process uploaded file
-    if uploaded_file:
-        file_content = process_uploaded_file(uploaded_file)
-        st.session_state.doc_content = file_content
-        c.execute("INSERT INTO documents (session_id, filename, content) VALUES (?, ?, ?)",
-                  (st.session_state.selected_session, uploaded_file.name, file_content))
+    # Button to create a new session
+    if st.sidebar.button("New Chat"):
+        st.session_state.selected_session = create_new_session(c, conn)
+        st.session_state.chat_history = []
+        st.rerun()
+
+    # Load chat messages for the selected session
+    if st.session_state.selected_session:
+        if 'chat_history' not in st.session_state:
+            st.session_state.chat_history = load_chat_history(c, st.session_state.selected_session)
+        if 'doc_content' not in st.session_state:
+            st.session_state.doc_content = load_document_content(c, st.session_state.selected_session)
+
+    add_css_and_html()
+
+    # Create a header container
+    header_container = st.container()
+    with header_container:
+        st.title("Personal Assistant Chatbot")
+
+    # Container for the conversation
+    conversation_container = st.container()
+
+    # Form for user input
+    input_container = st.container()
+    with input_container:
+        with st.form(key='chat_form', clear_on_submit=True):
+            user_input = st.text_input("Ask your personal assistant anything:")
+            uploaded_file = st.file_uploader("Upload a file", type=["txt", "pdf", "docx"])
+            submit_button = st.form_submit_button(label='Ask')
+
+    if submit_button and user_input:
+        # Add the user's message to chat history immediately
+        st.session_state.chat_history.append(("user", user_input))
+        c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "user", user_input))
         conn.commit()
 
-    # Check if the question is in the memory database
-    c.execute("SELECT response FROM memory WHERE question = ?", (user_input,))
-    row = c.fetchone()
-    if row:
-        response = row[0]
-    else:
-        if "weather" in user_input.lower():
-            location = user_input.split("in")[-1].strip() if "in" in user_input.lower() else "London"
-            response = get_weather(location)
-        elif "search" in user_input.lower():
-            search_results = search_web(user_input)
-            response = "\n".join([f"**{result['title']}**\n{result['link']}\n{result['snippet']}\n" for result in search_results])
+        # Process uploaded file
+        if uploaded_file:
+            file_content = process_uploaded_file(uploaded_file)
+            st.session_state.doc_content = file_content
+            c.execute("INSERT INTO documents (session_id, filename, content) VALUES (?, ?, ?)",
+                      (st.session_state.selected_session, uploaded_file.name, file_content))
+            conn.commit()
+
+        # Check if the question is in the memory database
+        c.execute("SELECT response FROM memory WHERE question = ?", (user_input,))
+        row = c.fetchone()
+        if row:
+            response = row[0]
         else:
-            prompt = create_prompt(user_input, st.session_state.doc_content)
-            response = get_completion(prompt, model="gpt-3.5-turbo")
+            if "weather" in user_input.lower():
+                location = user_input.split("in")[-1].strip() if "in" in user_input.lower() else "London"
+                response = get_weather(location, api_keys["weather_api_key"])
+            elif "search" in user_input.lower():
+                search_results = search_web(user_input, api_keys["serpapi_api_key"])
+                response = "\n".join([f"**{result['title']}**\n{result['link']}\n{result['snippet']}\n" for result in search_results])
+            else:
+                # Simplified RAG implementation
+                text_chunks = get_text_chunks(st.session_state.doc_content)
+                response = get_response(user_input, text_chunks)
 
-        # Save the question and response in the memory database
-        c.execute("INSERT INTO memory (question, response) VALUES (?, ?)", (user_input, response))
+            # Save the question and response in the memory database
+            c.execute("INSERT INTO memory (question, response) VALUES (?, ?)", (user_input, response))
+            conn.commit()
+
+        # Update chat history with the assistant's response
+        st.session_state.chat_history.append(("assistant", response))
+        c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "assistant", response))
         conn.commit()
 
-    # Update chat history with the assistant's response
-    st.session_state.chat_history.append(("assistant", response))
-    c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "assistant", response))
-    conn.commit()
+    # Display chat history when a session is selected
+    if st.session_state.selected_session and st.session_state.chat_history:
+        with conversation_container:
+            for role, content in st.session_state.chat_history:
+                role_class = 'user' if role == 'user' else 'assistant'
+                icon_url = "https://img.icons8.com/ios-filled/50/000000/user-male-circle.png" if role == 'user' else "https://img.icons8.com/fluency-systems-filled/48/bot.png"
+                html = f'''
+                    <div class="bubble-container">
+                        <div class="bubble {role_class}">{content}</div>
+                        <img src="{icon_url}" class="icon {role_class}" />
+                    </div>
+                    '''
+                st.markdown(html, unsafe_allow_html=True)
 
-# Display chat history when a session is selected
-if st.session_state.selected_session and st.session_state.chat_history:
-    with conversation_container:
-        for role, content in st.session_state.chat_history:
-            role_class = 'user' if role == 'user' else 'assistant'
-            icon_url = "https://img.icons8.com/ios-filled/50/000000/user-male-circle.png" if role == 'user' else "https://img.icons8.com/fluency-systems-filled/48/bot.png"
-            st.markdown(
-                f'''
-                <div class="bubble-container">
-                    <div class="bubble {role_class}">{content}</div>
-                    <img src="{icon_url}" class="icon {role_class}" />
-                </div>
-                ''',
-                unsafe_allow_html=True
-            )
+    conn.close()
 
-conn.close()
+if __name__ == "__main__":
+    main()
