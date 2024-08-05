@@ -7,13 +7,13 @@ from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores.faiss import FAISS
 from dotenv import load_dotenv, find_dotenv
-from openai import OpenAI
 from serpapi import GoogleSearch
 import datetime
 from PyPDF2 import PdfReader
 from docx import Document
 import boto3
 from css import css
+import tiktoken
 
 def load_api_keys():
     _ = load_dotenv(find_dotenv())
@@ -61,6 +61,8 @@ def get_text_chunks(text):
     return chunks
 
 def get_vector_store(text_chunks):
+    if not text_chunks:
+        raise ValueError("No text chunks to create vector store")
     embeddings = OpenAIEmbeddings()
     vector_store = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
     return vector_store
@@ -70,25 +72,40 @@ def get_relevant_chunks(user_input, vector_store):
     results = retriever.get_relevant_documents(user_input)
     return [result.page_content for result in results]
 
-def get_response(user_input, text_chunks):
-    vector_store = get_vector_store(text_chunks)
-    relevant_chunks = get_relevant_chunks(user_input, vector_store)
-    context = "\n".join(relevant_chunks)
-    
-    # Generate a response using OpenAI API with the retrieved context
-    truncated_context = truncate_text(context)
-    response = openai.completions.create(
-        model="gpt-3.5-turbo-instruct",
-        prompt=f"Context:\n{truncated_context}\n\nQuestion: {user_input}\nAnswer:",
-        max_tokens=150
-    )
-    return response.choices[0].text.strip()
+def count_tokens(text, model="gpt-3.5-turbo-instruct"):
+    tokenizer = tiktoken.get_encoding("cl100k_base")
+    tokens = tokenizer.encode(text)
+    return len(tokens)
 
-def truncate_text(text, max_tokens=4000):
-    words = text.split()
-    if len(words) > max_tokens:
-        return ' '.join(words[:max_tokens])
-    return text
+def truncate_text(text, max_tokens):
+    tokenizer = tiktoken.get_encoding("cl100k_base")
+    tokens = tokenizer.encode(text)
+    if len(tokens) > max_tokens:
+        tokens = tokens[:max_tokens]
+    return tokenizer.decode(tokens)
+
+def get_response(user_input, doc_content):
+    if doc_content:
+        text_chunks = get_text_chunks(doc_content)
+        vector_store = get_vector_store(text_chunks)
+        relevant_chunks = get_relevant_chunks(user_input, vector_store)
+        context = "\n".join(relevant_chunks)
+        truncated_context = truncate_text(context, 4097 - 150)
+        
+        # Generate a response using OpenAI API with the retrieved context
+        response = openai.completions.create(
+            model="gpt-3.5-turbo-instruct",
+            prompt=f"Context:\n{truncated_context}\n\nQuestion: {user_input}\nAnswer:",
+            max_tokens=150
+        )
+    else:
+        # Generate a general response using OpenAI API without document context
+        response = openai.completions.create(
+            model="gpt-3.5-turbo-instruct",
+            prompt=f"Question: {user_input}\nAnswer:",
+            max_tokens=150
+        )
+    return response.choices[0].text.strip()
 
 def search_web(query, serpapi_api_key):
     search = GoogleSearch({"q": query, "api_key": serpapi_api_key})
@@ -188,9 +205,10 @@ def main():
     if st.sidebar.button("New Chat"):
         st.session_state.selected_session = create_new_session(c, conn)
         st.session_state.chat_history = []
+        st.session_state.doc_content = ""
         st.rerun()
 
-    # Load chat messages for the selected session
+    # Load chat messages and document content for the selected session
     if st.session_state.selected_session:
         if 'chat_history' not in st.session_state:
             st.session_state.chat_history = load_chat_history(c, st.session_state.selected_session)
@@ -224,10 +242,12 @@ def main():
         # Process uploaded file
         if uploaded_file:
             file_content = process_uploaded_file(uploaded_file)
-            st.session_state.doc_content = file_content
+            st.session_state.doc_content += file_content
             c.execute("INSERT INTO documents (session_id, filename, content) VALUES (?, ?, ?)",
                       (st.session_state.selected_session, uploaded_file.name, file_content))
             conn.commit()
+            # Save the file to S3
+            save_file_to_s3(uploaded_file, api_keys)
 
         # Check if the question is in the memory database
         c.execute("SELECT response FROM memory WHERE question = ?", (user_input,))
@@ -242,9 +262,8 @@ def main():
                 search_results = search_web(user_input, api_keys["serpapi_api_key"])
                 response = "\n".join([f"**{result['title']}**\n{result['link']}\n{result['snippet']}\n" for result in search_results])
             else:
-                # Simplified RAG implementation
-                text_chunks = get_text_chunks(st.session_state.doc_content)
-                response = get_response(user_input, text_chunks)
+                # Use the general response for queries
+                response = get_response(user_input, st.session_state.doc_content if st.session_state.doc_content else "")
 
             # Save the question and response in the memory database
             c.execute("INSERT INTO memory (question, response) VALUES (?, ?)", (user_input, response))
