@@ -13,12 +13,15 @@ from PyPDF2 import PdfReader
 from docx import Document
 import boto3
 from css import css
+from js import js
 import tiktoken
+
+CACHE_EXPIRY_TIME = 60 * 10  # Cache expiry time in seconds (e.g., 10 minutes for weather data)
 
 def load_api_keys():
     _ = load_dotenv(find_dotenv())
     return {
-        "openai_api_key": os.environ.get("OPEN_API_KEY"),
+        "openai_api_key": os.environ.get("OPENAI_API_KEY"),
         "serpapi_api_key": os.environ.get("SERP_API_KEY"),
         "weather_api_key": os.environ.get("WEATHER_API_KEY"),
         "aws_access_key": os.environ.get("AWS_ACCESS_KEY"),
@@ -32,10 +35,15 @@ def initialize_openai(api_key):
 def initialize_db(db_path):
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS memory (question TEXT, response TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS memory (question TEXT, response TEXT, timestamp DATETIME)''')
     c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions (session_id TEXT PRIMARY KEY, name TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS chat_messages (session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS documents (session_id TEXT, filename TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    # Check if timestamp column exists in memory table, if not, add it
+    c.execute("PRAGMA table_info(memory)")
+    columns = [col[1] for col in c.fetchall()]
+    if 'timestamp' not in columns:
+        c.execute('ALTER TABLE memory ADD COLUMN timestamp DATETIME')
     conn.commit()
     return conn, c
 
@@ -113,13 +121,13 @@ def search_web(query, serpapi_api_key):
     return results.get("organic_results", [])
 
 def get_weather(location, weather_api_key):
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={location}&appid={weather_api_key}&units=metric"
+    url = f"http://api.openweathermap.org/data/2.5/weather?lat={location['latitude']}&lon={location['longitude']}&appid={weather_api_key}&units=metric"
     response = requests.get(url)
     if response.status_code == 200:
         data = response.json()
         weather_description = data['weather'][0]['description']
         temperature = data['main']['temp']
-        return f"The weather in {location} is {weather_description} with a temperature of {temperature}°C."
+        return f"The weather in your location is {weather_description} with a temperature of {temperature}°C."
     else:
         return "Sorry, I couldn't retrieve the weather information."
 
@@ -173,14 +181,25 @@ def display_sidebar_menu(c, sessions, conn):
 def add_css_and_html():
     st.markdown(css, unsafe_allow_html=True)
 
+def get_location():
+    location = st.query_params.get("location")
+    if location:
+        latitude, longitude = map(float, location[0].split(","))
+        return {"latitude": latitude, "longitude": longitude}
+    return None
+
 def main():
     st.set_page_config(layout="wide")
     st.sidebar.title("Chat Sessions")
 
     # Load API keys
     api_keys = load_api_keys()
-
+    
     # Initialize OpenAI
+    if api_keys["openai_api_key"] is None:
+        st.error("OpenAI API key is not set. Please set it in the .env file.")
+        return
+
     initialize_openai(api_keys["openai_api_key"])
 
     # Initialize database
@@ -217,6 +236,11 @@ def main():
 
     add_css_and_html()
 
+    # Get user location
+    location = get_location()
+    if not location:
+        st.markdown(js, unsafe_allow_html=True)
+
     # Create a header container
     header_container = st.container()
     with header_container:
@@ -249,14 +273,17 @@ def main():
             # Save the file to S3
             save_file_to_s3(uploaded_file, api_keys)
 
-        # Check if the question is in the memory database
-        c.execute("SELECT response FROM memory WHERE question = ?", (user_input,))
+        # Check if the question is in the memory database and if it's recent enough
+        current_time = datetime.datetime.now()
+        c.execute("SELECT response, timestamp FROM memory WHERE question = ?", (user_input,))
         row = c.fetchone()
         if row:
-            response = row[0]
-        else:
-            if "weather" in user_input.lower():
-                location = user_input.split("in")[-1].strip() if "in" in user_input.lower() else "London"
+            response, timestamp = row
+            # Check if the cached response is still valid
+            if (current_time - datetime.datetime.fromisoformat(timestamp)).total_seconds() > CACHE_EXPIRY_TIME:
+                row = None  # Invalidate the cached response
+        if not row:
+            if "weather" in user_input.lower() and location:
                 response = get_weather(location, api_keys["weather_api_key"])
             elif "search" in user_input.lower():
                 search_results = search_web(user_input, api_keys["serpapi_api_key"])
@@ -266,7 +293,7 @@ def main():
                 response = get_response(user_input, st.session_state.doc_content if st.session_state.doc_content else "")
 
             # Save the question and response in the memory database
-            c.execute("INSERT INTO memory (question, response) VALUES (?, ?)", (user_input, response))
+            c.execute("INSERT INTO memory (question, response, timestamp) VALUES (?, ?, ?)", (user_input, response, current_time.isoformat()))
             conn.commit()
 
         # Update chat history with the assistant's response
