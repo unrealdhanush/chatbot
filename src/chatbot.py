@@ -3,6 +3,8 @@ import requests
 import sqlite3
 import streamlit as st
 import openai
+import re
+import speech_recognition as sr
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores.faiss import FAISS
@@ -15,6 +17,10 @@ import boto3
 from css import css
 from js import js
 import tiktoken
+import pyttsx3
+from textblob import TextBlob
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity 
 
 CACHE_EXPIRY_TIME = 60 * 10  # Cache expiry time in seconds (e.g., 10 minutes for weather data)
 
@@ -35,13 +41,16 @@ def initialize_openai(api_key):
 def initialize_db(db_path):
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS memory (question TEXT, response TEXT, timestamp DATETIME)''')
+    # Create tables if not exist
+    c.execute('''CREATE TABLE IF NOT EXISTS memory (question TEXT, response TEXT, embedding BLOB, timestamp DATETIME)''')
     c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions (session_id TEXT PRIMARY KEY, name TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS chat_messages (session_id TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS documents (session_id TEXT, filename TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-    # Check if timestamp column exists in memory table, if not, add it
+    # Check if 'embedding' and 'timestamp' columns exist in memory table, if not, add them
     c.execute("PRAGMA table_info(memory)")
     columns = [col[1] for col in c.fetchall()]
+    if 'embedding' not in columns:
+        c.execute('ALTER TABLE memory ADD COLUMN embedding BLOB')
     if 'timestamp' not in columns:
         c.execute('ALTER TABLE memory ADD COLUMN timestamp DATETIME')
     conn.commit()
@@ -51,6 +60,28 @@ def save_file_to_s3(file, aws_keys):
     s3 = boto3.client('s3', aws_access_key_id=aws_keys["aws_access_key"], aws_secret_access_key=aws_keys["aws_secret_access_key"])
     file.seek(0)
     s3.upload_fileobj(file, aws_keys["aws_bucket"], file.name)
+
+def get_embedding(text):
+    response = openai.embeddings.create(
+        input=[text],
+        model="text-embedding-ada-002"
+    )
+    embedding = response.data[0].embedding
+    return embedding
+
+def find_similar_questions(embedding, c, top_k=3):
+    c.execute("SELECT question, response, embedding FROM memory")
+    rows = c.fetchall()
+    similarities = []
+    for question, response, stored_embedding_blob in rows:
+        if stored_embedding_blob is None:
+            continue  # Skip entries without embeddings
+        stored_embedding = np.frombuffer(stored_embedding_blob, dtype=np.float32)
+        sim = cosine_similarity([embedding], [stored_embedding])[0][0]
+        similarities.append((sim, question, response))
+    # Sort by similarity
+    similarities.sort(key=lambda x: x[0], reverse=True)
+    return similarities[:top_k]
 
 def process_uploaded_file(uploaded_file):
     if uploaded_file.type == "application/pdf":
@@ -80,8 +111,8 @@ def get_relevant_chunks(user_input, vector_store):
     results = retriever.get_relevant_documents(user_input)
     return [result.page_content for result in results]
 
-def count_tokens(text, model="gpt-3.5-turbo-instruct"):
-    tokenizer = tiktoken.get_encoding("cl100k_base")
+def count_tokens(text, model="gpt-3.5-turbo"):
+    tokenizer = tiktoken.encoding_for_model(model)
     tokens = tokenizer.encode(text)
     return len(tokens)
 
@@ -89,36 +120,75 @@ def truncate_text(text, max_tokens):
     tokenizer = tiktoken.get_encoding("cl100k_base")
     tokens = tokenizer.encode(text)
     if len(tokens) > max_tokens:
-        tokens = tokens[:max_tokens]
+        tokens = tokens[-max_tokens:]
     return tokenizer.decode(tokens)
 
-def get_response(user_input, doc_content):
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    return blob.sentiment.polarity  # Returns a value between -1.0 and 1.0
+
+def get_response(user_input, doc_content, chat_history, similar_past_interactions):
+    # Including last N messages for context
+    context_messages = [{"role": role, "content": content} for role, content in chat_history[-5:]]
+    user_message = {"role": "user", "content": user_input}
+
+    user_sentiment = analyze_sentiment(user_input)
+    if user_sentiment < -0.3:
+        system_prompt = "You are a compassionate assistant. Provide a thoughtful and empathetic response to the user's concerns."
+    else:
+        system_prompt = "You are a helpful assistant. Provide a thoughtful response to the user's concerns."
+
+    # Prepare past interactions context
+    past_interactions_text = "\n".join(
+        [f"User: {q}\nAssistant: {r}" for _, q, r in similar_past_interactions]
+    )
+    # Modify system_message to include past interactions
+    system_message = {
+        "role": "system",
+        "content": f"{system_prompt}\n\nHere are some past interactions that might help:\n{past_interactions_text}"
+    }
+
     if doc_content:
         text_chunks = get_text_chunks(doc_content)
         vector_store = get_vector_store(text_chunks)
         relevant_chunks = get_relevant_chunks(user_input, vector_store)
         context = "\n".join(relevant_chunks)
-        truncated_context = truncate_text(context, 4097 - 150)
-        
-        # Generate a response using OpenAI API with the retrieved context
-        response = openai.completions.create(
-            model="gpt-3.5-turbo-instruct",
-            prompt=f"Context:\n{truncated_context}\n\nQuestion: {user_input}\nAnswer:",
-            max_tokens=150
-        )
+        # Adjust max_tokens to account for context messages
+        total_allowed_tokens = 4096 - 150  # Model's max tokens minus response tokens
+        context_tokens = count_tokens("\n".join([msg["content"] for msg in context_messages]))
+        available_tokens = total_allowed_tokens - context_tokens
+        truncated_context = truncate_text(context, available_tokens)
+        context_message = {"role": "system", "content": f"Context:\n{truncated_context}"}
+        messages = [system_message, context_message] + context_messages + [user_message]
     else:
-        # Generate a general response using OpenAI API without document context
-        response = openai.completions.create(
-            model="gpt-3.5-turbo-instruct",
-            prompt=f"Question: {user_input}\nAnswer:",
-            max_tokens=150
-        )
-    return response.choices[0].text.strip()
+        messages = [system_message] + context_messages + [user_message]
+
+    response = openai.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        max_tokens=150
+    )
+    return response.choices[0].message.content.strip()
 
 def search_web(query, serpapi_api_key):
     search = GoogleSearch({"q": query, "api_key": serpapi_api_key})
     results = search.get_dict()
     return results.get("organic_results", [])
+
+def get_audio_input():
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        st.info("Listening...")
+        audio = r.listen(source)
+    try:
+        text = r.recognize_google(audio)
+        st.success(f"You said: {text}")
+        return text
+    except sr.UnknownValueError:
+        st.error("Sorry, I could not understand the audio.")
+    except sr.RequestError as e:
+        st.error(f"Could not request results; {e}")
+    return None
 
 def get_weather(location, weather_api_key):
     url = f"http://api.openweathermap.org/data/2.5/weather?lat={location['latitude']}&lon={location['longitude']}&appid={weather_api_key}&units=metric"
@@ -145,6 +215,37 @@ def create_new_session(c, conn):
     c.execute("INSERT INTO chat_sessions (session_id, name) VALUES (?, ?)", (session_id, f"Chat {session_id[-6:]}"))
     conn.commit()
     return session_id
+
+def generate_session_name(chat_history):
+    """
+    Generates a summary-based name for the chat session.
+    """
+    user_messages = [content for role, content in chat_history if role == 'user']
+    conversation_text = "\n".join(user_messages)
+    conversation_text = truncate_text(conversation_text, max_tokens=1000)
+
+    system_message = {
+        "role": "system",
+        "content": "You are an assistant that generates concise and descriptive session titles based on the conversation."
+    }
+    user_message = {
+        "role": "user",
+        "content": f"Summarize the main topic of the following conversation in a few words suitable as a session title:\n\n{conversation_text}\n\nSession Title:"
+    }
+
+    messages = [system_message, user_message]
+    
+    response = openai.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        max_tokens=10,
+        temperature=0.5,
+        n=1,
+        stop=["\n"]
+    )
+    session_name = response.choices[0].message.content.strip()
+    session_name = re.sub(r'[^\w\s\-]', '', session_name)
+    return session_name
 
 def display_sidebar_menu(c, sessions, conn):
     selected_session = st.session_state.selected_session
@@ -182,7 +283,8 @@ def add_css_and_html():
     st.markdown(css, unsafe_allow_html=True)
 
 def get_location():
-    location = st.query_params.get("location")
+    query_params = st.query_params
+    location = query_params.get("location")
     if location:
         latitude, longitude = map(float, location[0].split(","))
         return {"latitude": latitude, "longitude": longitude}
@@ -258,9 +360,12 @@ def main():
             submit_button = st.form_submit_button(label='Ask')
 
     if submit_button and user_input:
+        current_time = datetime.datetime.now()
+
         # Add the user's message to chat history immediately
         st.session_state.chat_history.append(("user", user_input))
-        c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "user", user_input))
+        c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)",
+                  (st.session_state.selected_session, "user", user_input))
         conn.commit()
 
         # Process uploaded file
@@ -273,34 +378,53 @@ def main():
             # Save the file to S3
             save_file_to_s3(uploaded_file, api_keys)
 
-        # Check if the question is in the memory database and if it's recent enough
-        current_time = datetime.datetime.now()
-        c.execute("SELECT response, timestamp FROM memory WHERE question = ?", (user_input,))
-        row = c.fetchone()
-        if row:
-            response, timestamp = row
-            # Check if the cached response is still valid
-            if (current_time - datetime.datetime.fromisoformat(timestamp)).total_seconds() > CACHE_EXPIRY_TIME:
-                row = None  # Invalidate the cached response
-        if not row:
-            if "weather" in user_input.lower() and location:
-                response = get_weather(location, api_keys["weather_api_key"])
-            elif "search" in user_input.lower():
-                search_results = search_web(user_input, api_keys["serpapi_api_key"])
-                response = "\n".join([f"**{result['title']}**\n{result['link']}\n{result['snippet']}\n" for result in search_results])
-            else:
-                # Use the general response for queries
-                response = get_response(user_input, st.session_state.doc_content if st.session_state.doc_content else "")
+        # Compute embedding for the new question
+        new_question_embedding = get_embedding(user_input)
 
-            # Save the question and response in the memory database
-            c.execute("INSERT INTO memory (question, response, timestamp) VALUES (?, ?, ?)", (user_input, response, current_time.isoformat()))
-            conn.commit()
+        # Retrieve similar past interactions
+        similar_past_interactions = find_similar_questions(new_question_embedding, c)
+
+        if "weather" in user_input.lower() and location:
+            response = get_weather(location, api_keys["weather_api_key"])
+        elif "search" in user_input.lower():
+            search_results = search_web(user_input, api_keys["serpapi_api_key"])
+            response = "\n".join([f"**{result['title']}**\n{result['link']}\n{result['snippet']}\n" for result in search_results])
+        else:
+            # Generate response using RAG
+            response = get_response(
+                user_input,
+                st.session_state.doc_content if st.session_state.doc_content else "",
+                st.session_state.chat_history,
+                similar_past_interactions
+            )
+
+        # Save the question, response, and embedding in the memory database
+        embedding_bytes = np.array(new_question_embedding, dtype=np.float32).tobytes()
+        c.execute(
+            "INSERT INTO memory (question, response, embedding, timestamp) VALUES (?, ?, ?, ?)",
+            (user_input, response, embedding_bytes, current_time.isoformat())
+        )
+        conn.commit()
 
         # Update chat history with the assistant's response
         st.session_state.chat_history.append(("assistant", response))
-        c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)", (st.session_state.selected_session, "assistant", response))
+        c.execute("INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)",
+                  (st.session_state.selected_session, "assistant", response))
         conn.commit()
-
+        c.execute("SELECT name FROM chat_sessions WHERE session_id = ?", (st.session_state.selected_session,))
+        current_session_name = c.fetchone()[0]
+        if current_session_name.startswith("Chat "):
+            # Generate a new session name
+            session_name = generate_session_name(st.session_state.chat_history)
+            if session_name:
+                c.execute("UPDATE chat_sessions SET name = ? WHERE session_id = ?",
+                          (session_name, st.session_state.selected_session))
+                conn.commit()
+                # Update the sessions list and rerun to refresh the sidebar
+                c.execute("SELECT session_id, name, timestamp FROM chat_sessions ORDER BY timestamp DESC")
+                sessions = c.fetchall()
+                st.rerun()
+        
     # Display chat history when a session is selected
     if st.session_state.selected_session and st.session_state.chat_history:
         with conversation_container:
