@@ -120,7 +120,7 @@ def truncate_text(text, max_tokens):
     tokenizer = tiktoken.get_encoding("cl100k_base")
     tokens = tokenizer.encode(text)
     if len(tokens) > max_tokens:
-        tokens = tokens[-max_tokens:]
+        tokens = tokens[:max_tokens]
     return tokenizer.decode(tokens)
 
 def analyze_sentiment(text):
@@ -147,26 +147,30 @@ def get_response(user_input, doc_content, chat_history, similar_past_interaction
         "role": "system",
         "content": f"{system_prompt}\n\nHere are some past interactions that might help:\n{past_interactions_text}"
     }
-
+    total_allowed_tokens = 4096
     if doc_content:
         text_chunks = get_text_chunks(doc_content)
         vector_store = get_vector_store(text_chunks)
         relevant_chunks = get_relevant_chunks(user_input, vector_store)
         context = "\n".join(relevant_chunks)
-        # Adjust max_tokens to account for context messages
-        total_allowed_tokens = 4096 - 150  # Model's max tokens minus response tokens
-        context_tokens = count_tokens("\n".join([msg["content"] for msg in context_messages]))
-        available_tokens = total_allowed_tokens - context_tokens
+        prompt_tokens = count_tokens("\n".join([msg["content"] for msg in [system_message] + context_messages + [user_message]]))
+        available_tokens = total_allowed_tokens - prompt_tokens - 500
+        available_tokens = max(0, available_tokens)
         truncated_context = truncate_text(context, available_tokens)
         context_message = {"role": "system", "content": f"Context:\n{truncated_context}"}
         messages = [system_message, context_message] + context_messages + [user_message]
     else:
         messages = [system_message] + context_messages + [user_message]
 
+    prompt_tokens = count_tokens("\n".join([msg["content"] for msg in messages]))
+    max_response_tokens = total_allowed_tokens - prompt_tokens
+    max_response_tokens = min(max_response_tokens, 1024)
+    max_response_tokens = max(max_response_tokens, 150)
+    
     response = openai.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=messages,
-        max_tokens=150
+        max_tokens=max_response_tokens
     )
     return response.choices[0].message.content.strip()
 
