@@ -9,3 +9,4 @@ PyPDF2
 python-docx
 boto3
 faiss-cpu
+speech_recognition
