@@ -2,3 +2,5 @@
 /data
 *.env
 /__pycache__
+*.log
+src/test_boto3.py
