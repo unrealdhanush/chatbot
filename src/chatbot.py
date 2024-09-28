@@ -19,26 +19,74 @@ from sklearn.metrics.pairwise import cosine_similarity
 from serpapi import GoogleSearch
 import tiktoken
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import sagemaker
 from sagemaker.huggingface.model import HuggingFaceModel
 import atexit
+import threading
+import time
 
 CACHE_EXPIRY_TIME = 60 * 10  # Cache expiry time in seconds (e.g., 10 minutes for weather data)
 
-# Logs
-logging.basicConfig(
-    filename='chatbot.log',
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(name)s %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Logs Engine
+class LoggerSetup:
+    def __init__(self, log_dir="logs", daily_backup_count=7, weekly_backup_count=4, monthly_backup_count=12):
+        self.log_dir = log_dir
+        self.daily_backup_count = daily_backup_count
+        self.weekly_backup_count = weekly_backup_count
+        self.monthly_backup_count = monthly_backup_count
+
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+        self.setup_handlers()
+
+    def setup_handlers(self):
+        # Daily log handler
+        daily_log_path = os.path.join(self.log_dir, "chatbot_daily.log")
+        daily_handler = TimedRotatingFileHandler(
+            daily_log_path, when="midnight", interval=1, backupCount=self.daily_backup_count
+        )
+        daily_handler.setLevel(logging.INFO)
+        daily_handler.setFormatter(self.get_formatter())
+        self.logger.addHandler(daily_handler)
+
+        # Weekly log handler
+        weekly_log_path = os.path.join(self.log_dir, "chatbot_weekly.log")
+        weekly_handler = TimedRotatingFileHandler(
+            weekly_log_path, when="W0", interval=1, backupCount=self.weekly_backup_count
+        )
+        weekly_handler.setLevel(logging.INFO)
+        weekly_handler.setFormatter(self.get_formatter())
+        self.logger.addHandler(weekly_handler)
+
+        # Monthly log handler
+        monthly_log_path = os.path.join(self.log_dir, "chatbot_monthly.log")
+        monthly_handler = TimedRotatingFileHandler(
+            monthly_log_path, when="midnight", interval=30, backupCount=self.monthly_backup_count
+        )
+        monthly_handler.setLevel(logging.INFO)
+        monthly_handler.setFormatter(self.get_formatter())
+        self.logger.addHandler(monthly_handler)
+        
+    def get_formatter(self):
+        return logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+
+    def get_logger(self):
+        return self.logger
+
+# Initialize the logger
+logger_setup = LoggerSetup()
+logger = logger_setup.get_logger()
 
 # Global variables
 LAST_ENDPOINT_USAGE = None
 ENDPOINT_IDLE_TIMEOUT = 30 * 60  # 30 minutes
 
 def load_api_keys():
-    _ = load_dotenv(find_dotenv())
+    _ = load_dotenv(find_dotenv(), override=True)
     return {
         "openai_api_key": os.environ.get("OPENAI_API_KEY"),
         "serpapi_api_key": os.environ.get("SERP_API_KEY"),
@@ -74,15 +122,24 @@ def check_and_deploy_sagemaker_endpoint(api_keys):
     # Check if the endpoint exists
     try:
         response = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
-        if response['EndpointStatus'] == 'InService':
+        status = response['EndpointStatus']
+        if status == 'InService':
             logger.info(f"Endpoint '{endpoint_name}' is already in service.")
             return
+        elif status in ['Creating', 'Updating']:
+            logger.info(f"Endpoint '{endpoint_name}' status: {status}. Waiting for it to be InService.")
+            waiter = sagemaker_client.get_waiter('endpoint_in_service')
+            waiter.wait(EndpointName=endpoint_name)
+            logger.info(f"Endpoint '{endpoint_name}' is now InService.")
+            return
         else:
-            logger.info(f"Endpoint '{endpoint_name}' exists but is not in service. Status: {response['EndpointStatus']}")
+            logger.info(f"Endpoint '{endpoint_name}' status: {status}. Deleting and redeploying.")
+            sagemaker_client.delete_endpoint(EndpointName=endpoint_name)
+            deploy_sagemaker_endpoint(api_keys)
     except sagemaker_client.exceptions.ClientError as e:
         error_code = e.response['Error']['Code']
         if error_code == 'ValidationException':
-            logger.info(f"Endpoint '{endpoint_name}' does not exist. Proceeding to deploy.")
+            logger.info(f"Endpoint '{endpoint_name}' does not exist. Deploying it now.")
             deploy_sagemaker_endpoint(api_keys)
         else:
             logger.error(f"Error checking endpoint status: {e}")
@@ -91,44 +148,61 @@ def check_and_deploy_sagemaker_endpoint(api_keys):
 def deploy_sagemaker_endpoint(api_keys):
     try:
         aws_region = api_keys["aws_region"]
-        if not aws_region:
-            logger.error("AWS_REGION is not set.")
-            raise ValueError("AWS_REGION is not set.")
         role = api_keys["sagemaker_role_arn"]
         endpoint_name = api_keys["sentiment_endpoint_name"]
 
-        # Initialize SageMaker session
         sess = sagemaker.Session(boto_session=boto3.Session(
             region_name=aws_region,
             aws_access_key_id=api_keys["aws_access_key"],
             aws_secret_access_key=api_keys["aws_secret_access_key"]
         ))
 
-        # Hugging Face model configuration
-        hub = {
-            'HF_MODEL_ID': 'distilbert-base-uncased-finetuned-sst-2-english',
-            'HF_TASK': 'text-classification'
-        }
+        # Check if endpoint configuration already exists
+        existing_configs = sess.sagemaker_client.list_endpoint_configs()['EndpointConfigs']
+        if any(config['EndpointConfigName'] == endpoint_name for config in existing_configs):
+            logger.info(f"Endpoint configuration '{endpoint_name}' already exists. Reusing it.")
+            endpoint_config_name = endpoint_name
+        else:
+            logger.info(f"Creating a new endpoint configuration '{endpoint_name}'.")
+            # Hugging Face model configuration
+            hub = {
+                'HF_MODEL_ID': 'distilbert-base-uncased-finetuned-sst-2-english',
+                'HF_TASK': 'text-classification'
+            }
 
-        # Create Hugging Face Model
-        huggingface_model = HuggingFaceModel(
-            env=hub,
-            role=role,
-            transformers_version='4.17',
-            pytorch_version='1.10',
-            py_version='py38',
-        )
+            # Create Hugging Face Model
+            huggingface_model = HuggingFaceModel(
+                env=hub,
+                role=role,
+                transformers_version='4.17',
+                pytorch_version='1.10',
+                py_version='py38',
+            )
 
-        # Deploy the model to SageMaker
-        predictor = huggingface_model.deploy(
-            initial_instance_count=1,
-            instance_type='ml.m5.xlarge',
-            endpoint_name=endpoint_name,
-        )
-        logger.info(f"Successfully deployed endpoint '{endpoint_name}'.")
+            # Deploy the model to SageMaker
+            predictor = huggingface_model.deploy(
+                initial_instance_count=1,
+                instance_type='ml.m5.xlarge',
+                endpoint_name=endpoint_name,
+                wait=True,
+                endpoint_config_name=endpoint_name  # Reuse the existing name
+            )
+            logger.info(f"Successfully deployed endpoint '{endpoint_name}' with existing config.")
     except Exception as e:
         logger.error(f"Failed to deploy endpoint: {e}")
         raise
+
+def endpoint_idle_monitor(api_keys):
+    global LAST_ENDPOINT_USAGE
+    while True:
+        time.sleep(60)  # Check every 60 seconds
+        if LAST_ENDPOINT_USAGE:
+            idle_time = time.time() - LAST_ENDPOINT_USAGE
+            if idle_time > ENDPOINT_IDLE_TIMEOUT:
+                logger.info(f"Endpoint idle for {idle_time} seconds. Deleting endpoint.")
+                delete_sagemaker_endpoint(api_keys)
+                LAST_ENDPOINT_USAGE = None
+                break
 
 def delete_sagemaker_endpoint(api_keys):
     try:
@@ -139,8 +213,22 @@ def delete_sagemaker_endpoint(api_keys):
             aws_secret_access_key=api_keys["aws_secret_access_key"]
         )
         endpoint_name = api_keys["sentiment_endpoint_name"]
-        sagemaker_client.delete_endpoint(EndpointName=endpoint_name)
-        logger.info(f"Successfully deleted endpoint '{endpoint_name}'.")
+
+        # Check if the endpoint exists
+        try:
+            sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
+            # If no exception is raised, the endpoint exists
+            logger.info(f"Endpoint '{endpoint_name}' exists. Proceeding to delete it.")
+            sagemaker_client.delete_endpoint(EndpointName=endpoint_name)
+            logger.info(f"Successfully deleted endpoint '{endpoint_name}'.")
+        except sagemaker_client.exceptions.ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'ValidationException' and 'Could not find endpoint' in e.response['Error']['Message']:
+                # Endpoint does not exist
+                logger.info(f"Endpoint '{endpoint_name}' does not exist. No deletion needed.")
+            else:
+                # Some other error occurred
+                logger.error(f"Failed to delete endpoint '{endpoint_name}': {e}")
     except Exception as e:
         logger.error(f"Failed to delete endpoint: {e}")
 
@@ -204,19 +292,29 @@ def truncate_text(text, max_tokens):
     return tokenizer.decode(tokens)
 
 def analyze_sentiment(text, sagemaker_runtime, endpoint_name):
-    payload = {
-        "inputs": text
-    }
-    response = sagemaker_runtime.invoke_endpoint(
-        EndpointName=endpoint_name,
-        ContentType='application/json',
-        Body=json.dumps(payload)
-    )
-    result = json.loads(response['Body'].read().decode())
-    label = result[0]['label']
-    score = result[0]['score']
-    sentiment_score = score if label == 'POSITIVE' else -score
-    return sentiment_score  # Returns a value between -1.0 and 1.0
+    global LAST_ENDPOINT_USAGE
+    
+    try:
+        LAST_ENDPOINT_USAGE = time.time()
+        payload = {
+            "inputs": text
+        }
+        response = sagemaker_runtime.invoke_endpoint(
+            EndpointName=endpoint_name,
+            ContentType='application/json',
+            Body=json.dumps(payload)
+        )
+        result = json.loads(response['Body'].read().decode())
+        label = result[0]['label']
+        score = result[0]['score']
+        sentiment_score = score if label == 'POSITIVE' else -score
+        return sentiment_score  # Returns a value between -1.0 and 1.0
+    except sagemaker_runtime.exceptions.ValidationError as e:
+        logger.error(f"Sentiment Analysis Failed: {e}")
+        return 0.0
+    except Exception as e:
+        logger.error(f"Sentiment Analysis Failed: {e}")
+        return 0.0
 
 def get_response(user_input, doc_content, chat_history, similar_past_interactions, sagemaker_runtime, sentiment_endpoint_name):
     # Including last N messages for context
@@ -315,8 +413,7 @@ def add_css_and_html():
     st.markdown(css, unsafe_allow_html=True)
 
 def get_location():
-    query_params = st.experimental_get_query_params()
-    location = query_params.get("location")
+    location = st.query_params.get("location")
     if location:
         latitude, longitude = map(float, location[0].split(","))
         return {"latitude": latitude, "longitude": longitude}
@@ -326,6 +423,37 @@ def main():
     st.set_page_config(layout="wide")
     st.sidebar.title("Chat Sessions")
 
+    # Initialize session state variables
+    if 'sessions' not in st.session_state:
+        st.session_state.sessions = {}
+    if 'selected_session' not in st.session_state:
+        st.session_state.selected_session = None
+    
+    # Initialize session state variables
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+
+    if 'doc_content' not in st.session_state:
+        st.session_state.doc_content = ""
+
+    if 'vector_store' not in st.session_state:
+        st.session_state.vector_store = None
+
+    if 'memory' not in st.session_state:
+        st.session_state.memory = []
+    
+    # If no sessions exist, create a new one
+    if not st.session_state.sessions:
+        session_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+        st.session_state.sessions[session_id] = {
+            'name': f"Chat {session_id[-6:]}",
+            'chat_history': [],
+            'doc_content': "",
+            'vector_store': None,
+            'memory': []
+        }
+        st.session_state.selected_session = session_id
+        
     # Load API keys
     api_keys = load_api_keys()
 
@@ -352,12 +480,8 @@ def main():
     )
     sentiment_endpoint_name = api_keys["sentiment_endpoint_name"]
 
-    # Initialize sessions in session state
-    if 'sessions' not in st.session_state:
-        st.session_state.sessions = {}
-    if 'selected_session' not in st.session_state:
-        st.session_state.selected_session = None
-
+    threading.Thread(target=endpoint_idle_monitor, args=(api_keys,), daemon=True).start()
+    
     # Display the sidebar menu with chat sessions
     selected_session = st.session_state.selected_session
     for session_id, session_data in st.session_state.sessions.items():
@@ -370,17 +494,17 @@ def main():
                 st.session_state.chat_history = session_data['chat_history']
                 st.session_state.doc_content = session_data.get('doc_content', "")
                 st.session_state.vector_store = session_data.get('vector_store', None)
-                st.experimental_rerun()
+                st.rerun()
             if st.button("Rename", key=f"rename_{session_id}"):
                 new_name = st.text_input("New name", key=f"new_name_{session_id}")
                 if new_name:
                     st.session_state.sessions[session_id]['name'] = new_name
-                    st.experimental_rerun()
+                    st.rerun()
             if st.button("Delete", key=f"delete_{session_id}"):
                 del st.session_state.sessions[session_id]
                 st.session_state.selected_session = None
                 st.session_state.chat_history = []
-                st.experimental_rerun()
+                st.rerun()
 
     # Button to create a new session
     if st.sidebar.button("New Chat"):
@@ -397,7 +521,7 @@ def main():
         st.session_state.doc_content = ""
         st.session_state.vector_store = None
         st.session_state.memory = []
-        st.experimental_rerun()
+        st.rerun()
 
     # Load chat history and document content for the selected session
     if st.session_state.selected_session:
@@ -502,7 +626,7 @@ def main():
             session_name = generate_session_name(st.session_state.chat_history)
             if session_name:
                 session_data['name'] = session_name
-                st.experimental_rerun()
+                st.rerun()
 
     # Display chat history when a session is selected
     if st.session_state.selected_session and st.session_state.chat_history:
