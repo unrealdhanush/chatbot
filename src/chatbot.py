@@ -10,25 +10,30 @@ import datetime
 from dotenv import load_dotenv, find_dotenv
 from PyPDF2 import PdfReader
 from docx import Document
-from css import css
-from js import js
 from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores.faiss import FAISS
 from sklearn.metrics.pairwise import cosine_similarity
 from serpapi import GoogleSearch
 import tiktoken
 import logging
+from css import css
+from js import js
 from logging.handlers import TimedRotatingFileHandler
 import sagemaker
 from sagemaker.huggingface.model import HuggingFaceModel
 import atexit
 import threading
 import time
+import tempfile
+import bcrypt
 
-CACHE_EXPIRY_TIME = 60 * 10  # Cache expiry time in seconds (e.g., 10 minutes for weather data)
+# -----------------------------------------------------------------------------------
+# 1. Set Page Configuration (Must be the first Streamlit command)
+st.set_page_config(page_title="Personal Assistant Chatbot", page_icon="🤖", layout="wide")
 
-# Logs Engine
+# -----------------------------------------------------------------------------------
+# 2. Logger Setup
 class LoggerSetup:
     def __init__(self, log_dir="logs", daily_backup_count=7, weekly_backup_count=4, monthly_backup_count=12):
         self.log_dir = log_dir
@@ -81,36 +86,43 @@ class LoggerSetup:
 logger_setup = LoggerSetup()
 logger = logger_setup.get_logger()
 
-# Global variables
+# -----------------------------------------------------------------------------------
+# 3. Global Variables
 LAST_ENDPOINT_USAGE = None
 ENDPOINT_IDLE_TIMEOUT = 30 * 60  # 30 minutes
 
+# -----------------------------------------------------------------------------------
+# 4. Utility Functions
+
 def load_api_keys():
-    _ = load_dotenv(find_dotenv(), override=True)
+    load_dotenv(find_dotenv(), override=True)
     return {
         "openai_api_key": os.environ.get("OPENAI_API_KEY"),
         "serpapi_api_key": os.environ.get("SERP_API_KEY"),
         "weather_api_key": os.environ.get("WEATHER_API_KEY"),
         "aws_access_key": os.environ.get("AWS_ACCESS_KEY"),
         "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        "aws_bucket": os.environ.get("AWS_BUCKET"),
         "aws_region": os.environ.get("AWS_REGION"),
         "sentiment_endpoint_name": os.environ.get("SENTIMENT_ENDPOINT_NAME"),
-        "sagemaker_role_arn": os.environ.get("SAGEMAKER_ROLE_ARN")
+        "sagemaker_role_arn": os.environ.get("SAGEMAKER_ROLE_ARN"),
+        "aws_bucket": os.environ.get("AWS_BUCKET")
     }
 
 def initialize_openai(api_key):
     openai.api_key = api_key
 
+def get_dynamodb_resource():
+    return boto3.resource('dynamodb')  # Credentials are handled via environment variables or IAM roles
+
 def initialize_sagemaker_client(aws_region, aws_access_key, aws_secret_access_key):
     return boto3.client(
         'sagemaker-runtime',
         region_name=aws_region,
-        aws_access_key_id=aws_access_key,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY"),
         aws_secret_access_key=aws_secret_access_key
     )
 
-def check_and_deploy_sagemaker_endpoint(api_keys):
+def create_endpoint(api_keys):
     sagemaker_client = boto3.client(
         'sagemaker',
         region_name=api_keys["aws_region"],
@@ -119,49 +131,45 @@ def check_and_deploy_sagemaker_endpoint(api_keys):
     )
     endpoint_name = api_keys["sentiment_endpoint_name"]
 
-    # Check if the endpoint exists
     try:
-        response = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
-        status = response['EndpointStatus']
-        if status == 'InService':
-            logger.info(f"Endpoint '{endpoint_name}' is already in service.")
-            return
-        elif status in ['Creating', 'Updating']:
-            logger.info(f"Endpoint '{endpoint_name}' status: {status}. Waiting for it to be InService.")
-            waiter = sagemaker_client.get_waiter('endpoint_in_service')
-            waiter.wait(EndpointName=endpoint_name)
-            logger.info(f"Endpoint '{endpoint_name}' is now InService.")
-            return
+        # Create the new endpoint
+        response = sagemaker_client.create_endpoint(
+            EndpointName=endpoint_name, 
+            EndpointConfigName=endpoint_name
+        )
+        
+        if 'EndpointArn' in response:
+            logger.info(f"Endpoint '{endpoint_name}' creation initiated.")
+            return True
         else:
-            logger.info(f"Endpoint '{endpoint_name}' status: {status}. Deleting and redeploying.")
-            sagemaker_client.delete_endpoint(EndpointName=endpoint_name)
-            deploy_sagemaker_endpoint(api_keys)
-    except sagemaker_client.exceptions.ClientError as e:
-        error_code = e.response['Error']['Code']
-        if error_code == 'ValidationException':
-            logger.info(f"Endpoint '{endpoint_name}' does not exist. Deploying it now.")
-            deploy_sagemaker_endpoint(api_keys)
-        else:
-            logger.error(f"Error checking endpoint status: {e}")
-            raise
+            logger.error(f"Endpoint creation response returned without an EndpointArn. Something went wrong.")
+            return False
 
-def deploy_sagemaker_endpoint(api_keys):
+    except sagemaker_client.exceptions.ClientError as e:
+        logger.error(f"Error creating the SageMaker endpoint '{endpoint_name}': {e}")
+        return False
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during endpoint creation: {e}")
+        return False
+
+def describe_sagemaker_endpoint(api_keys):
     try:
         aws_region = api_keys["aws_region"]
         role = api_keys["sagemaker_role_arn"]
         endpoint_name = api_keys["sentiment_endpoint_name"]
 
-        sess = sagemaker.Session(boto_session=boto3.Session(
+        sess = boto3.Session(
             region_name=aws_region,
             aws_access_key_id=api_keys["aws_access_key"],
             aws_secret_access_key=api_keys["aws_secret_access_key"]
-        ))
+        )
+        sagemaker_client = sess.client('sagemaker')
 
         # Check if endpoint configuration already exists
-        existing_configs = sess.sagemaker_client.list_endpoint_configs()['EndpointConfigs']
+        existing_configs = sagemaker_client.list_endpoint_configs()['EndpointConfigs']
         if any(config['EndpointConfigName'] == endpoint_name for config in existing_configs):
             logger.info(f"Endpoint configuration '{endpoint_name}' already exists. Reusing it.")
-            endpoint_config_name = endpoint_name
+            # No action needed if config exists
         else:
             logger.info(f"Creating a new endpoint configuration '{endpoint_name}'.")
             # Hugging Face model configuration
@@ -179,18 +187,91 @@ def deploy_sagemaker_endpoint(api_keys):
                 py_version='py38',
             )
 
-            # Deploy the model to SageMaker
-            predictor = huggingface_model.deploy(
+            # Deploy the model to SageMaker (creates EndpointConfig)
+            huggingface_model.deploy(
                 initial_instance_count=1,
                 instance_type='ml.m5.xlarge',
                 endpoint_name=endpoint_name,
                 wait=True,
                 endpoint_config_name=endpoint_name  # Reuse the existing name
             )
-            logger.info(f"Successfully deployed endpoint '{endpoint_name}' with existing config.")
+            logger.info(f"Successfully deployed endpoint configuration '{endpoint_name}'.")
+
     except Exception as e:
-        logger.error(f"Failed to deploy endpoint: {e}")
+        logger.error(f"Failed to deploy endpoint configuration: {e}")
         raise
+
+def check_and_deploy_sagemaker_endpoint(api_keys):
+    sagemaker_client = boto3.client(
+        'sagemaker',
+        region_name=api_keys["aws_region"],
+        aws_access_key_id=api_keys["aws_access_key"],
+        aws_secret_access_key=api_keys["aws_secret_access_key"]
+    )
+    endpoint_name = api_keys["sentiment_endpoint_name"]
+
+    try:
+        existing_endpoint = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
+        status = existing_endpoint['EndpointStatus']
+        if status == 'InService':
+            logger.info(f"Endpoint '{endpoint_name}' is already InService.")
+            st.session_state['endpoint_deployed'] = True
+            return
+        elif status in ['Creating', 'Updating']:
+            logger.info(f"Endpoint '{endpoint_name}' is in status '{status}'. Waiting for it to become InService.")
+            waiter = sagemaker_client.get_waiter('endpoint_in_service')
+            waiter.wait(EndpointName=endpoint_name)
+            logger.info(f"Endpoint '{endpoint_name}' is now InService.")
+            st.session_state['endpoint_deployed'] = True
+            return
+        elif status == 'Failed':
+            logger.info(f"Endpoint '{endpoint_name}' status is 'Failed'. Deleting and recreating.")
+            sagemaker_client.delete_endpoint(EndpointName=endpoint_name)
+            waiter = sagemaker_client.get_waiter('endpoint_deleted')
+            waiter.wait(EndpointName=endpoint_name)
+            logger.info(f"Deleted failed endpoint '{endpoint_name}' successfully.")
+            # Proceed to recreate
+            describe_sagemaker_endpoint(api_keys)
+            if create_endpoint(api_keys):
+                st.session_state['endpoint_deployed'] = True
+            else:
+                st.error("Failed to create SageMaker endpoint.")
+    except sagemaker_client.exceptions.ResourceNotFound:
+        logger.info(f"Endpoint '{endpoint_name}' does not exist. Creating a new one.")
+        # Create EndpointConfig if needed
+        describe_sagemaker_endpoint(api_keys)
+        # Now create the endpoint
+        if create_endpoint(api_keys):
+            st.session_state['endpoint_deployed'] = True
+        else:
+            st.error("Failed to create SageMaker endpoint.")
+    except sagemaker_client.exceptions.ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code == 'ValidationException':
+            logger.info(f"Endpoint '{endpoint_name}' does not exist. Creating it now.")
+            # Create EndpointConfig if needed
+            describe_sagemaker_endpoint(api_keys)
+            # Now create the endpoint
+            if create_endpoint(api_keys):
+                st.session_state['endpoint_deployed'] = True
+            else:
+                st.error("Failed to create SageMaker endpoint.")
+        else:
+            logger.error(f"Error checking SageMaker endpoint: {e}")
+            st.error("An error occurred while checking the SageMaker endpoint status.")
+            raise
+
+def deploy_endpoint_async(api_keys):
+    """
+    Deploy the SageMaker endpoint in a separate thread to avoid blocking the main app.
+    """
+    if 'endpoint_deployment_started' not in st.session_state:
+        st.session_state['endpoint_deployment_started'] = False
+
+    if not st.session_state['endpoint_deployment_started']:
+        st.session_state['endpoint_deployment_started'] = True
+        deployment_thread = threading.Thread(target=check_and_deploy_sagemaker_endpoint, args=(api_keys,))
+        deployment_thread.start()
 
 def endpoint_idle_monitor(api_keys):
     global LAST_ENDPOINT_USAGE
@@ -209,8 +290,8 @@ def delete_sagemaker_endpoint(api_keys):
         sagemaker_client = boto3.client(
             'sagemaker',
             region_name=api_keys["aws_region"],
-            aws_access_key_id=api_keys["aws_access_key"],
-            aws_secret_access_key=api_keys["aws_secret_access_key"]
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY")
         )
         endpoint_name = api_keys["sentiment_endpoint_name"]
 
@@ -242,6 +323,98 @@ def save_file_to_s3(file, aws_keys):
     file.seek(0)
     s3.upload_fileobj(file, aws_keys["aws_bucket"], file.name)
     return file.name  # Returns the key of the uploaded file
+
+def save_sessions_to_s3(sessions, api_keys, username):
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=api_keys["aws_access_key"],
+        aws_secret_access_key=api_keys["aws_secret_access_key"],
+        region_name=api_keys["aws_region"]
+    )
+    bucket_name = api_keys["aws_bucket"]
+
+    for session_id, session_data in sessions.items():
+        # Prepare session data without vector_store
+        session_data_copy = session_data.copy()
+        vector_store = session_data_copy.pop('vector_store', None)
+
+        # Serialize session data to JSON
+        session_json = json.dumps(session_data_copy)
+
+        # Save session JSON to S3 under user-specific prefix
+        session_key = f"sessions/{username}/{session_id}/session_data.json"
+        s3_client.put_object(Bucket=bucket_name, Key=session_key, Body=session_json)
+
+        # Save vector_store to S3
+        if vector_store is not None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                vector_store.save_local(temp_dir)
+                for filename in os.listdir(temp_dir):
+                    file_path = os.path.join(temp_dir, filename)
+                    vector_store_key = f"sessions/{username}/{session_id}/{filename}"
+                    s3_client.upload_file(file_path, bucket_name, vector_store_key)
+
+def load_sessions_from_s3(api_keys, username):
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=api_keys["aws_access_key"],
+        aws_secret_access_key=api_keys["aws_secret_access_key"],
+        region_name=api_keys["aws_region"]
+    )
+    bucket_name = api_keys["aws_bucket"]
+
+    sessions = {}
+
+    # List all sessions for the user in the bucket
+    prefix = f"sessions/{username}/"
+    paginator = s3_client.get_paginator('list_objects_v2')
+    pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+    prefixes = set()
+    for page in pages:
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            parts = key.split('/')
+            if len(parts) >= 4:
+                session_id = parts[2]
+                prefixes.add(session_id)
+
+    for session_id in prefixes:
+        # Load session data
+        session_key = f"sessions/{username}/{session_id}/session_data.json"
+        try:
+            session_obj = s3_client.get_object(Bucket=bucket_name, Key=session_key)
+            session_json = session_obj['Body'].read().decode('utf-8')
+            session_data = json.loads(session_json)
+        except Exception as e:
+            logger.error(f"Failed to load session data for session {session_id}: {e}")
+            continue
+
+        # Load vector_store
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Download all vector store files for the session
+                vector_store_prefix = f"sessions/{username}/{session_id}/"
+                vector_store_objects = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=vector_store_prefix)
+                if 'Contents' in vector_store_objects:
+                    for obj in vector_store_objects['Contents']:
+                        key = obj['Key']
+                        filename = key.split('/')[-1]
+                        if filename.startswith('index'):
+                            file_path = os.path.join(temp_dir, filename)
+                            s3_client.download_file(bucket_name, key, file_path)
+                    # Load the vector store
+                    embeddings = OpenAIEmbeddings()
+                    vector_store = FAISS.load_local(temp_dir, embeddings)
+                    session_data['vector_store'] = vector_store
+                else:
+                    session_data['vector_store'] = None
+        except Exception as e:
+            logger.warning(f"No vector store found for session {session_id}: {e}")
+            session_data['vector_store'] = None
+
+        sessions[session_id] = session_data
+
+    return sessions
 
 def process_uploaded_file(uploaded_file):
     if uploaded_file.type == "application/pdf":
@@ -410,50 +583,109 @@ def generate_session_name(chat_history):
     return session_name
 
 def add_css_and_html():
+    # Assuming you have CSS content in a variable named 'css'
     st.markdown(css, unsafe_allow_html=True)
 
 def get_location():
     location = st.query_params.get("location")
     if location:
-        latitude, longitude = map(float, location[0].split(","))
-        return {"latitude": latitude, "longitude": longitude}
+        try:
+            latitude, longitude = map(float, location[0].split(","))
+            return {"latitude": latitude, "longitude": longitude}
+        except ValueError:
+            return None
     return None
 
+# -----------------------------------------------------------------------------------
+# 5. Authentication Functions
+
+def login():
+    st.header("Login")
+
+    # Login Form
+    with st.form(key='login_form', clear_on_submit=True):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        login_button = st.form_submit_button(label='Login')
+
+    if login_button:
+        if not username or not password:
+            st.error("Please enter both username and password.")
+        else:
+            try:
+                dynamodb = get_dynamodb_resource()
+                users_table = dynamodb.Table('Users')
+
+                # Retrieve user from DynamoDB
+                response = users_table.get_item(Key={'username': username})
+                user = response.get('Item')
+
+                if user:
+                    stored_password_hash = user['password_hash'].encode('utf-8')
+                    if bcrypt.checkpw(password.encode('utf-8'), stored_password_hash):
+                        st.session_state['authenticated'] = True
+                        st.session_state['username'] = username
+                        st.session_state['name'] = user['name']
+                        st.success(f"Welcome, {user['name']}!")
+                        st.rerun()
+                    else:
+                        st.error("Incorrect username or password.")
+                else:
+                    st.error("Incorrect username or password.")
+            except Exception as e:
+                logger.error(f"Error accessing DynamoDB: {e}")
+                st.error("An error occurred during login. Please try again later.")
+
+def register():
+    st.header("Register")
+
+    # Registration Form
+    with st.form(key='register_form', clear_on_submit=True):
+        username = st.text_input("Username")
+        name = st.text_input("Full Name")
+        password = st.text_input("Password", type="password")
+        confirm_password = st.text_input("Confirm Password", type="password")
+        register_button = st.form_submit_button(label='Register')
+
+    if register_button:
+        if not username or not name or not password or not confirm_password:
+            st.error("Please fill out all fields.")
+        elif password != confirm_password:
+            st.error("Passwords do not match.")
+        else:
+            try:
+                dynamodb = get_dynamodb_resource()
+                users_table = dynamodb.Table('Users')
+
+                # Check if username already exists
+                response = users_table.get_item(Key={'username': username})
+                if 'Item' in response:
+                    st.error("Username already exists. Please choose a different one.")
+                else:
+                    # Hash the password
+                    password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+
+                    # Add the new user to DynamoDB
+                    users_table.put_item(
+                        Item={
+                            'username': username,
+                            'name': name,
+                            'password_hash': password_hash.decode('utf-8')
+                        }
+                    )
+                    st.success("Registration successful! You can now log in.")
+                    st.info("Please switch to the **Login** tab to access the chatbot.")
+            except Exception as e:
+                logger.error(f"Error registering user: {e}")
+                st.error("An error occurred during registration. Please try again later.")
+
+# -----------------------------------------------------------------------------------
+# 6. Main Application
+
 def main():
-    st.set_page_config(layout="wide")
-    st.sidebar.title("Chat Sessions")
-
-    # Initialize session state variables
-    if 'sessions' not in st.session_state:
-        st.session_state.sessions = {}
-    if 'selected_session' not in st.session_state:
-        st.session_state.selected_session = None
+    username = st.session_state.get('username')
+    name = st.session_state.get('name')
     
-    # Initialize session state variables
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = []
-
-    if 'doc_content' not in st.session_state:
-        st.session_state.doc_content = ""
-
-    if 'vector_store' not in st.session_state:
-        st.session_state.vector_store = None
-
-    if 'memory' not in st.session_state:
-        st.session_state.memory = []
-    
-    # If no sessions exist, create a new one
-    if not st.session_state.sessions:
-        session_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
-        st.session_state.sessions[session_id] = {
-            'name': f"Chat {session_id[-6:]}",
-            'chat_history': [],
-            'doc_content': "",
-            'vector_store': None,
-            'memory': []
-        }
-        st.session_state.selected_session = session_id
-        
     # Load API keys
     api_keys = load_api_keys()
 
@@ -471,43 +703,83 @@ def main():
         st.error("Failed to deploy or access the SageMaker endpoint. Please check the logs for more details.")
         logger.error(f"Application failed to start due to SageMaker endpoint issues: {e}")
         return
-    
+
     # Initialize SageMaker client
     sagemaker_runtime = initialize_sagemaker_client(
         api_keys["aws_region"],
-        api_keys["aws_access_key"],
-        api_keys["aws_secret_access_key"]
+        os.environ.get("AWS_ACCESS_KEY"),
+        os.environ.get("AWS_SECRET_ACCESS_KEY")
     )
     sentiment_endpoint_name = api_keys["sentiment_endpoint_name"]
 
+    # Start endpoint idle monitor thread
     threading.Thread(target=endpoint_idle_monitor, args=(api_keys,), daemon=True).start()
-    
-    # Display the sidebar menu with chat sessions
+
+    # Initialize session state variables
+    if 'sessions' not in st.session_state:
+        st.session_state.sessions = load_sessions_from_s3(api_keys, st.session_state.get('username', ''))
+    if 'selected_session' not in st.session_state:
+        st.session_state.selected_session = None
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    if 'doc_content' not in st.session_state:
+        st.session_state.doc_content = ""
+    if 'vector_store' not in st.session_state:
+        st.session_state.vector_store = None
+    if 'memory' not in st.session_state:
+        st.session_state.memory = []
+
+    # If no sessions exist, create a new one
+    if not st.session_state.sessions:
+        session_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+        st.session_state.sessions[session_id] = {
+            'name': f"Chat {session_id[-6:]}",
+            'chat_history': [],
+            'doc_content': "",
+            'vector_store': None,
+            'memory': []
+        }
+        st.session_state.selected_session = session_id
+
+    # Sidebar: Chat Sessions (Dynamic Sidebar Integration)
+    st.sidebar.header("Chat Sessions")
+
     selected_session = st.session_state.selected_session
     for session_id, session_data in st.session_state.sessions.items():
-        session_name = session_data['name']
-        label = session_name if session_name else f"Chat {session_id[-6:]}"
+        session_name = session_data.get('name', f"Chat {session_id[-6:]}")
+        label = session_name
         is_selected = session_id == selected_session
-        with st.sidebar.expander(label, expanded=is_selected):
-            if st.button("Open", key=f"open_{session_id}"):
-                st.session_state.selected_session = session_id
-                st.session_state.chat_history = session_data['chat_history']
-                st.session_state.doc_content = session_data.get('doc_content', "")
-                st.session_state.vector_store = session_data.get('vector_store', None)
-                st.rerun()
-            if st.button("Rename", key=f"rename_{session_id}"):
-                new_name = st.text_input("New name", key=f"new_name_{session_id}")
-                if new_name:
-                    st.session_state.sessions[session_id]['name'] = new_name
-                    st.rerun()
-            if st.button("Delete", key=f"delete_{session_id}"):
-                del st.session_state.sessions[session_id]
-                st.session_state.selected_session = None
-                st.session_state.chat_history = []
-                st.rerun()
 
-    # Button to create a new session
+        with st.sidebar.expander(label, expanded=is_selected):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if st.button("Open", key=f"open_{session_id}"):
+                    st.session_state.selected_session = session_id
+                    st.session_state.chat_history = session_data.get('chat_history', [])
+                    st.session_state.doc_content = session_data.get('doc_content', "")
+                    st.session_state.vector_store = session_data.get('vector_store', None)
+                    st.rerun()
+            with col2:
+                rename_clicked = st.button("Rename", key=f"rename_{session_id}")
+                if rename_clicked:
+                    new_name = st.text_input("New name", key=f"new_name_{session_id}")
+                    if new_name:
+                        st.session_state.sessions[session_id]['name'] = new_name
+                        # Save the updated sessions to S3
+                        save_sessions_to_s3(st.session_state.sessions, api_keys, username)
+                        st.rerun()
+            with col3:
+                if st.button("Delete", key=f"delete_{session_id}"):
+                    del st.session_state.sessions[session_id]
+                    st.session_state.selected_session = None
+                    st.session_state.chat_history = []
+                    # Save the updated sessions to S3
+                    save_sessions_to_s3(st.session_state.sessions, api_keys, username)
+                    st.rerun()
+    
+    # New Chat Button
     if st.sidebar.button("New Chat"):
+        # Create a new session
         session_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
         st.session_state.sessions[session_id] = {
             'name': f"Chat {session_id[-6:]}",
@@ -521,8 +793,13 @@ def main():
         st.session_state.doc_content = ""
         st.session_state.vector_store = None
         st.session_state.memory = []
+        save_sessions_to_s3(st.session_state.sessions, api_keys, username)
         st.rerun()
-
+    
+    if st.sidebar.button("Logout"):
+            st.session_state.clear()  # Clear all session state
+            st.rerun()
+    
     # Load chat history and document content for the selected session
     if st.session_state.selected_session:
         session_data = st.session_state.sessions[st.session_state.selected_session]
@@ -542,6 +819,7 @@ def main():
     header_container = st.container()
     with header_container:
         st.title("Personal Assistant Chatbot")
+        st.subheader(f"Welcome, {st.session_state.get('name', 'User')}!")
 
     # Container for the conversation
     conversation_container = st.container()
@@ -615,7 +893,7 @@ def main():
         st.session_state.chat_history.append(("assistant", response))
 
         # Update session data
-        session_data = st.session_state.sessions[st.session_state.selected_session]
+        session_data = st.session_state.sessions.get(st.session_state.selected_session, {})
         session_data['chat_history'] = st.session_state.chat_history
         session_data['doc_content'] = st.session_state.doc_content
         session_data['vector_store'] = st.session_state.vector_store
@@ -641,12 +919,39 @@ def main():
                     </div>
                     '''
                 st.markdown(html, unsafe_allow_html=True)
-    
-    # Deleting Sagemaker resources to minimize costs            
+
+    # Save sessions to S3 on exit
+    def save_sessions_callback():
+        logger.info("Application is exiting. Saving sessions to S3.")
+        username = st.session_state.get('username', '')
+        if 'sessions' in st.session_state and username:
+            try:
+                save_sessions_to_s3(st.session_state.sessions, api_keys, username)
+                logger.info("Sessions saved successfully.")
+            except Exception as e:
+                logger.error(f"Failed to save sessions on exit: {e}")
+        else:
+            logger.info("No sessions to save or user not logged in.")
+
+    # Delete SageMaker endpoint on exit
     def on_exit():
         logger.info("Application is exiting. Deleting SageMaker endpoint.")
         delete_sagemaker_endpoint(api_keys)
     atexit.register(on_exit)
 
+# -----------------------------------------------------------------------------------
+# 7. Run the Application
+
 if __name__ == "__main__":
-    main()
+    # Authentication Check
+    if 'authenticated' not in st.session_state or not st.session_state['authenticated']:
+        # Display Login and Register forms in the main container using Tabs
+        tabs = st.tabs(["Login", "Register"])
+
+        with tabs[0]:
+            login()
+
+        with tabs[1]:
+            register()
+    else:
+        main()
