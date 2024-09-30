@@ -50,23 +50,23 @@ RAG is a technique that combines retrieval-based and generation-based methods to
 
 ## Usage
 
-1. Authentication: Users must either register or log in via the login/register forms to access the chatbot interface. The user data is stored in DynamoDB.
+1. **Authentication:** Users must either register or log in via the login/register forms to access the chatbot interface. The user data is stored in DynamoDB.
 
-2. Chatting with the assistant: Once logged in, users can chat with the assistant by typing their queries. The assistant uses OpenAI GPT-3.5 for generating responses.
+2. **Chatting with the assistant:** Once logged in, users can chat with the assistant by typing their queries. The assistant uses OpenAI GPT-3.5 for generating responses.
 
-3. Document processing: Users can upload PDF, DOCX, or TXT files. The content of the uploaded files will be split into chunks and embedded for retrieval-based question answering.
+3. **Document processing:** Users can upload PDF, DOCX, or TXT files. The content of the uploaded files will be split into chunks and embedded for retrieval-based question answering.
 
-4. Web search: The chatbot can search the web using SerpAPI and return relevant results.
+4. **Web search:** The chatbot can search the web using SerpAPI and return relevant results.
 
-5. Weather information: By providing location details, users can ask for weather updates using the OpenWeatherMap API.
+5. **Weather information:** By providing location details, users can ask for weather updates using the OpenWeatherMap API.
 
-6. Session management: The chat history, uploaded documents, and embeddings are saved per session. Sessions are stored in AWS S3 and can be retrieved for continuity.
+6. **Session management:** The chat history, uploaded documents, and embeddings are saved per session. Sessions are stored in AWS S3 and can be retrieved for continuity.
 
 ## API Integrations
-- OpenAI GPT-3.5: For generating responses and embeddings.
-- SerpAPI: For web searches. (Currently not active, but you can activate)
-- OpenWeatherMap: For weather information. (Currently not active, but you can activate)
-- AWS (S3, DynamoDB, SageMaker): For session management, sentiment analysis, and storing user data.
+- **OpenAI GPT-3.5:** For generating responses and embeddings.
+- **SerpAPI:** For web searches. (Currently not active, but you can activate)
+- **OpenWeatherMap:** For weather information. (Currently not active, but you can activate)
+- **AWS (S3, DynamoDB, SageMaker):** For session management, sentiment analysis, and storing user data.
 
 ## Logs and Monitoring
 - The project includes a logging system that records daily, weekly, and monthly logs to a `logs/` directory. This is helpful for monitoring chatbot interactions and tracking errors.
