@@ -29,7 +29,7 @@ import tempfile
 import bcrypt
 
 # -----------------------------------------------------------------------------------
-# 1. Set Page Configuration (Must be the first Streamlit command)
+# 1. Set Page Configuration
 st.set_page_config(page_title="Personal Assistant Chatbot", page_icon="🤖", layout="wide")
 
 # -----------------------------------------------------------------------------------
@@ -93,20 +93,45 @@ ENDPOINT_IDLE_TIMEOUT = 30 * 60  # 30 minutes
 
 # -----------------------------------------------------------------------------------
 # 4. Utility Functions
+def get_secrets(secret_name, region):
+    client = boto3.client("secretsmanager", region_name=region)
+    
+    try:
+        response = client.get_secret_value(SecretId=secret_name)
+        if "SecretString" in response:
+            secret = response["SecretString"]
+            return json.loads(secret)
+        else:
+            secret = response["SecretBinary"]
+            return json.loads(secret.decode("utf-8"))
+    except client.exceptions.ResourceNotFoundException:
+        print(f"Secret {secret_name} not found.")
+    except Exception as e:
+        print(f"An error occured: {e}")
+        
+    return None
 
-def load_api_keys():
-    load_dotenv(find_dotenv(), override=True)
-    return {
-        "openai_api_key": os.environ.get("OPENAI_API_KEY"),
-        "serpapi_api_key": os.environ.get("SERP_API_KEY"),
-        "weather_api_key": os.environ.get("WEATHER_API_KEY"),
-        "aws_access_key": os.environ.get("AWS_ACCESS_KEY"),
-        "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        "aws_region": os.environ.get("AWS_REGION"),
-        "sentiment_endpoint_name": os.environ.get("SENTIMENT_ENDPOINT_NAME"),
-        "sagemaker_role_arn": os.environ.get("SAGEMAKER_ROLE_ARN"),
-        "aws_bucket": os.environ.get("AWS_BUCKET")
-    }
+def load_secrets(secret_name = 'my-chatbot-secrets', region = 'us-east-1'):
+    secret_name = 'my-chatbot-secrets'
+    region = 'us-east-1'
+    secrets = get_secrets(secret_name, region)
+    try:
+        if secrets:
+            return {
+                "openai_api_key": secrets.get('openai_api_key'),
+                "serpapi_api_key": secrets.get('serpapi_api_key'),
+                "weather_api_key": secrets.get('weather_api_key'),
+                "aws_access_key": secrets.get('aws_access_key'),
+                "aws_secret_access_key": secrets.get('aws_secret_access_key'),
+                "aws_region": region,
+                "sentiment_endpoint_name": secrets.get('sentiment_endpoint_name'),
+                "sagemaker_role_arn": secrets.get('sagemaker_role_arn'),
+                "aws_bucket": secrets.get('aws_bucket')
+            }
+        else:
+            raise Exception('Secrets retrieval unsuccessful')
+    except Exception as e:
+        print(f"An error occured: {e}")
 
 def initialize_openai(api_key):
     openai.api_key = api_key
@@ -118,7 +143,7 @@ def initialize_sagemaker_client(aws_region, aws_access_key, aws_secret_access_ke
     return boto3.client(
         'sagemaker-runtime',
         region_name=aws_region,
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY"),
+        aws_access_key_id=aws_access_key,
         aws_secret_access_key=aws_secret_access_key
     )
 
@@ -290,8 +315,8 @@ def delete_sagemaker_endpoint(api_keys):
         sagemaker_client = boto3.client(
             'sagemaker',
             region_name=api_keys["aws_region"],
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY")
+            aws_access_key_id=api_keys["aws_access_key"],
+            aws_secret_access_key=api_keys["aws_secret_access_key"]
         )
         endpoint_name = api_keys["sentiment_endpoint_name"]
 
@@ -324,6 +349,11 @@ def save_file_to_s3(file, aws_keys):
     s3.upload_fileobj(file, aws_keys["aws_bucket"], file.name)
     return file.name  # Returns the key of the uploaded file
 
+def default_converter(o):
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f'Object of type {o.__class__.__name__} is not JSON serializable')
+
 def save_sessions_to_s3(sessions, api_keys, username):
     s3_client = boto3.client(
         's3',
@@ -339,7 +369,7 @@ def save_sessions_to_s3(sessions, api_keys, username):
         vector_store = session_data_copy.pop('vector_store', None)
 
         # Serialize session data to JSON
-        session_json = json.dumps(session_data_copy)
+        session_json = json.dumps(session_data_copy, default=default_converter)
 
         # Save session JSON to S3 under user-specific prefix
         session_key = f"sessions/{username}/{session_id}/session_data.json"
@@ -351,8 +381,9 @@ def save_sessions_to_s3(sessions, api_keys, username):
                 vector_store.save_local(temp_dir)
                 for filename in os.listdir(temp_dir):
                     file_path = os.path.join(temp_dir, filename)
-                    vector_store_key = f"sessions/{username}/{session_id}/{filename}"
-                    s3_client.upload_file(file_path, bucket_name, vector_store_key)
+                    s3_key = f"sessions/{username}/{session_id}/{filename}"
+                    s3_client.upload_file(file_path, bucket_name, s3_key)
+                    print(f"Uploaded {filename} to {s3_key}")
 
 def load_sessions_from_s3(api_keys, username):
     s3_client = boto3.client(
@@ -362,13 +393,14 @@ def load_sessions_from_s3(api_keys, username):
         region_name=api_keys["aws_region"]
     )
     bucket_name = api_keys["aws_bucket"]
-
+    
     sessions = {}
 
     # List all sessions for the user in the bucket
     prefix = f"sessions/{username}/"
     paginator = s3_client.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+    
     prefixes = set()
     for page in pages:
         for obj in page.get('Contents', []):
@@ -395,21 +427,25 @@ def load_sessions_from_s3(api_keys, username):
                 # Download all vector store files for the session
                 vector_store_prefix = f"sessions/{username}/{session_id}/"
                 vector_store_objects = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=vector_store_prefix)
+                
                 if 'Contents' in vector_store_objects:
                     for obj in vector_store_objects['Contents']:
                         key = obj['Key']
                         filename = key.split('/')[-1]
-                        if filename.startswith('index'):
-                            file_path = os.path.join(temp_dir, filename)
-                            s3_client.download_file(bucket_name, key, file_path)
-                    # Load the vector store
-                    embeddings = OpenAIEmbeddings()
-                    vector_store = FAISS.load_local(temp_dir, embeddings)
-                    session_data['vector_store'] = vector_store
+                        file_path = os.path.join(temp_dir, filename)
+                        s3_client.download_file(bucket_name, key, file_path)
+                    
+                    # Load FAISS vector store safely
+                    embeddings = OpenAIEmbeddings(openai_api_key=api_keys["openai_api_key"])
+                    session_data['vector_store'] = FAISS.load_local(
+                        temp_dir, 
+                        embeddings, 
+                        allow_dangerous_deserialization=True  # Only enable this for trusted sources
+                    )
                 else:
                     session_data['vector_store'] = None
         except Exception as e:
-            logger.warning(f"No vector store found for session {session_id}: {e}")
+            logger.warning(f"Skipping vector store for session {session_id}: {e}")
             session_data['vector_store'] = None
 
         sessions[session_id] = session_data
@@ -449,7 +485,7 @@ def get_embedding(text):
         input=[text],
         model="text-embedding-ada-002"
     )
-    embedding = response['data'][0]['embedding']
+    embedding = response.data[0].embedding
     return embedding
 
 def count_tokens(text, model="gpt-3.5-turbo"):
@@ -598,7 +634,6 @@ def get_location():
 
 # -----------------------------------------------------------------------------------
 # 5. Authentication Functions
-
 def login():
     st.header("Login")
 
@@ -681,14 +716,13 @@ def register():
 
 # -----------------------------------------------------------------------------------
 # 6. Main Application
-
 def main():
     username = st.session_state.get('username')
     name = st.session_state.get('name')
     
     # Load API keys
-    api_keys = load_api_keys()
-
+    api_keys = load_secrets()
+    
     # Initialize OpenAI
     if api_keys["openai_api_key"] is None:
         st.error("OpenAI API key is not set. Please set it in the .env file.")
@@ -707,8 +741,8 @@ def main():
     # Initialize SageMaker client
     sagemaker_runtime = initialize_sagemaker_client(
         api_keys["aws_region"],
-        os.environ.get("AWS_ACCESS_KEY"),
-        os.environ.get("AWS_SECRET_ACCESS_KEY")
+        api_keys["aws_access_key"],
+        api_keys["aws_secret_access_key"]
     )
     sentiment_endpoint_name = api_keys["sentiment_endpoint_name"]
 
@@ -797,8 +831,9 @@ def main():
         st.rerun()
     
     if st.sidebar.button("Logout"):
-            st.session_state.clear()  # Clear all session state
-            st.rerun()
+        save_sessions_to_s3(st.session_state.sessions, api_keys, username)
+        st.session_state.clear()  # Clear all session state
+        st.rerun()
     
     # Load chat history and document content for the selected session
     if st.session_state.selected_session:
@@ -837,7 +872,7 @@ def main():
 
         # Add the user's message to chat history immediately
         st.session_state.chat_history.append(("user", user_input))
-
+        
         # Process uploaded file
         if uploaded_file:
             # Save the file to S3
@@ -849,6 +884,13 @@ def main():
             text_chunks = get_text_chunks(st.session_state.doc_content)
             vector_store = get_vector_store(text_chunks)
             st.session_state.vector_store = vector_store
+
+        # Create a placeholder for the typing indicator
+        typing_placeholder = st.empty()
+        typing_placeholder.markdown(
+            "<div class='bubble assistant'>Bot is typing...</div>", 
+            unsafe_allow_html=True
+        )
 
         # Compute embedding for the new question
         try:
@@ -865,6 +907,7 @@ def main():
             if sim > 0.7:  # threshold
                 similar_past_interactions.append((memory_entry['question'], memory_entry['response']))
 
+        # Determine response based on input context
         if "weather" in user_input.lower() and location:
             response = get_weather(location, api_keys["weather_api_key"])
         elif "search" in user_input.lower():
@@ -881,6 +924,12 @@ def main():
                 sentiment_endpoint_name
             )
 
+        # Remove the typing indicator
+        typing_placeholder.empty()
+
+        # Save the bot response in the chat history
+        st.session_state.chat_history.append(("assistant", response))
+
         # Save the question, response, and embedding in the session memory
         st.session_state.memory.append({
             'question': user_input,
@@ -888,9 +937,6 @@ def main():
             'embedding': new_question_embedding,
             'timestamp': current_time.isoformat()
         })
-
-        # Update chat history with the assistant's response
-        st.session_state.chat_history.append(("assistant", response))
 
         # Update session data
         session_data = st.session_state.sessions.get(st.session_state.selected_session, {})
@@ -937,11 +983,11 @@ def main():
     def on_exit():
         logger.info("Application is exiting. Deleting SageMaker endpoint.")
         delete_sagemaker_endpoint(api_keys)
+        save_sessions_callback()
     atexit.register(on_exit)
 
 # -----------------------------------------------------------------------------------
 # 7. Run the Application
-
 if __name__ == "__main__":
     # Authentication Check
     if 'authenticated' not in st.session_state or not st.session_state['authenticated']:
