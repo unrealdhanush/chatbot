@@ -216,7 +216,7 @@ def describe_sagemaker_endpoint(api_keys):
             huggingface_model.deploy(
                 initial_instance_count=1,
                 instance_type='ml.m5.xlarge',
-                endpoint_name=endpoint_name,
+                 endpoint_name=endpoint_name,
                 wait=True,
                 endpoint_config_name=endpoint_name  # Reuse the existing name
             )
@@ -732,7 +732,7 @@ def main():
 
     # Check and deploy SageMaker endpoint if needed
     try:
-        check_and_deploy_sagemaker_endpoint(api_keys)
+        deploy_endpoint_async(api_keys)
     except Exception as e:
         st.error("Failed to deploy or access the SageMaker endpoint. Please check the logs for more details.")
         logger.error(f"Application failed to start due to SageMaker endpoint issues: {e}")
